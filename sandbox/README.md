@@ -1,5 +1,10 @@
 # Sandbox MVP integration
 
+Reusable image preparation is documented in [template/README.md](template/README.md).
+The Python/DuckDB 1.5.4 definition is committed but **not built**: the current
+CreateOS Free plan shows `Upgrade plan` for templates despite available credits.
+No template name or restrictive-egress verification is claimed yet.
+
 `lib/sandbox/createos.ts` implements the unchanged `SandboxRuntime` contract.
 It uploads a CSV or Parquet file to a paused CreateOS VM, forks a child for each
 execution attempt, waits for `running`, and destroys/waits for that child before
