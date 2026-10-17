@@ -18,6 +18,9 @@ describe("checkGeneratedCode", () => {
     ["().__class__", "dunder access"],
     ["con.execute(\"COPY orders TO 'x.csv'\")", "DuckDB I/O statement"],
     ["con.execute(\"SELECT * FROM read_csv('/data/x')\")", "direct file read"],
+    ["print(con.execute('SELECT 1').fetchall())", "missing top-level `result =`"],
+    ["result = {'columns': [], 'rows': []}", "result must include groupSizes"],
+    ["import re\nresult = {'groupSizes': []}", "import not allowed: re"],
   ])("blocks %s", (code, violation) => {
     const result = checkGeneratedCode(code);
     expect(result.ok).toBe(false);

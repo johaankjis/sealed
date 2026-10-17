@@ -1,9 +1,12 @@
 // Cheap pre-flight check on generated Python before it is sent to the sandbox.
 // This is defence in depth only: the CreateOS sandbox and the OutputPolicy are
 // the real boundaries. It catches obvious model mistakes early and saves a
-// sandbox round-trip.
+// sandbox round-trip. GLM's validateGeneratedCode runs as well; a script must
+// pass both.
 
-const ALLOWED_IMPORTS = new Set(["duckdb", "json", "math", "statistics"]);
+import { validateGeneratedCode } from "../security";
+
+const ALLOWED_IMPORTS = new Set(["duckdb", "json", "math", "statistics", "datetime", "decimal"]);
 
 const FORBIDDEN_PATTERNS: Array<[RegExp, string]> = [
   [/\b__import__\b/, "dynamic import"],
@@ -39,6 +42,15 @@ export function checkGeneratedCode(code: string): CodeCheckResult {
 
   for (const [pattern, label] of FORBIDDEN_PATTERNS) {
     if (pattern.test(code)) violations.push(`forbidden construct: ${label}`);
+  }
+
+  // The sandbox runner reads `result`; group sizes are needed by the policy.
+  if (!/^result\s*=/m.test(code)) violations.push("missing top-level `result =` assignment");
+  if (!code.includes("groupSizes")) violations.push("result must include groupSizes");
+  if (!/count\s*\(/i.test(code)) violations.push("query must compute COUNT(*) for group sizes");
+
+  for (const v of validateGeneratedCode(code).violations) {
+    violations.push(`security policy (${v.rule}): ${v.detail}`);
   }
 
   return { ok: violations.length === 0, violations };
