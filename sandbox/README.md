@@ -1,5 +1,9 @@
 # Sandbox MVP integration
 
+Temporary synthetic-only attachment to the existing `sealed-runtime` VM is
+documented in [SINGLE_SANDBOX.md](SINGLE_SANDBOX.md). Snapshot/fork remains the
+default implementation; the orchestration owner must explicitly select shared mode.
+
 Reusable image preparation is documented in [template/README.md](template/README.md).
 The Python/DuckDB 1.5.4 definition is committed but **not built**: the current
 CreateOS Free plan shows `Upgrade plan` for templates despite available credits.
