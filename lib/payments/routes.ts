@@ -1,5 +1,4 @@
 import type Stripe from "stripe";
-import { DEMO_DATASETS } from "../../components/datasets";
 import type { QueryJob } from "../../contracts/job";
 import type { PaymentProvider, PaymentVerification } from "../../contracts/payments";
 import {
@@ -8,7 +7,7 @@ import {
   type AgentEvent,
   confirmPayment,
   type DatasetCatalog,
-  type DatasetDescriptor,
+  DEMO_CATALOG,
   executeJob,
   failPayment,
   InMemoryJobStore,
@@ -52,16 +51,7 @@ const globalRef = globalThis as typeof globalThis & {
 };
 
 function buildDefaultDatasetCatalog(): DatasetCatalog {
-  const descriptors: DatasetDescriptor[] = DEMO_DATASETS.map((item) => ({
-    id: item.id,
-    name: item.name,
-    description: item.description,
-    path: `lib/agent/fixtures/${item.id}.csv`,
-    tableName: "dataset",
-    columns: [],
-    priceCents: item.priceCents,
-  }));
-  return new StaticDatasetCatalog(descriptors);
+  return new StaticDatasetCatalog(DEMO_CATALOG);
 }
 
 function buildLazyPaymentProvider(): PaymentProvider {
@@ -209,6 +199,8 @@ function mapCheckoutErrorToResponse(err: unknown): Response {
  * - Resolves pricing exclusively from the server-side `DatasetCatalog` (`dataset.priceCents` in `"usd"`),
  *   never from buyer request input.
  * - Creates a Stripe Checkout session and transitions the job to `"payment_pending"`.
+ * - Idempotently returns the existing session on retry while the job is in `"payment_pending"`,
+ *   or returns HTTP 409 if the job is no longer awaiting checkout or if session association mismatches.
  */
 export async function handleCheckoutPost(
   request: Request,
