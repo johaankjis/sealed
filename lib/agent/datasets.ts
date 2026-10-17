@@ -17,8 +17,12 @@ export interface DatasetDescriptor {
   /** DuckDB table/view name the generated code queries. */
   tableName: string;
   columns: DatasetColumn[];
-  /** Total records; used to cross-check reported group sizes. */
-  rowCount: number;
+  /**
+   * Total records; used to cross-check reported group sizes. Optional for
+   * catalog shape compatibility, but results for a dataset without it are
+   * always rejected (fail closed).
+   */
+  rowCount?: number;
   priceCents: number;
 }
 

@@ -11,7 +11,7 @@ import type { ExecutionResult } from "../../contracts/results";
 export interface GroupSizeEvidenceOptions {
   minGroupSize: number;
   /** Total records in the dataset, from the trusted catalog. */
-  datasetRowCount: number;
+  datasetRowCount: number | undefined;
 }
 
 /** Returns a rejection reason, or undefined when the evidence is acceptable. */
@@ -33,8 +33,11 @@ export function checkGroupSizeEvidence(
   if (small !== -1) {
     return `row ${small} aggregates fewer than ${options.minGroupSize} records`;
   }
+  if (options.datasetRowCount === undefined || !Number.isSafeInteger(options.datasetRowCount)) {
+    return "dataset has no trusted row count; results cannot be released";
+  }
   const total = groupSizes.reduce((sum, n) => sum + n, 0);
-  if (!Number.isSafeInteger(options.datasetRowCount) || total > options.datasetRowCount) {
+  if (total > options.datasetRowCount) {
     return "groupSizes are inconsistent with the dataset size; use non-overlapping groups";
   }
   return undefined;

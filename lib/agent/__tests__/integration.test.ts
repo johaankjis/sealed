@@ -13,7 +13,7 @@ import { StaticDatasetCatalog } from "../datasets";
 import { SnapshotAuthorizer } from "../executionAuth";
 import { InMemoryJobStore } from "../jobStore";
 import type { AgentEvent } from "../orchestrator";
-import { setAgentRuntime, verifyEgressBlocked } from "../server";
+import { catalogTableNameResolver, setAgentRuntime, verifyEgressBlocked } from "../server";
 import { FakePayments } from "./fakes";
 
 // End to end through the real API routes, ClaudeCodeGenerator, orchestrator,
@@ -93,51 +93,90 @@ function simulateAnalysis(code: string, csv: string): string {
   throw new Error("unexpected analysis code");
 }
 
+type VMState = "running" | "paused" | "forking" | "destroyed";
+
+// Mirrors the CreateOSSandbox surface lib/sandbox/createos.ts uses, including
+// its state rules: fork() returns a clone still in `forking`, and commands
+// only run once waitUntilRunning() has been awaited.
 class FakeVM implements CreateOSSandbox {
   static created: FakeVM[] = [];
+  /** Exit code the next analysis run reports (e.g. 137 for a timeout kill). */
+  static analysisExitCode = 0;
   stored = new Map<string, string | ArrayBuffer>();
-  destroyed = false;
+  state: VMState;
   ranAnalysis = false;
   files = {
     upload: async (path: string, data: string | ArrayBuffer) => {
+      this.assertRunning();
       this.stored.set(path, data);
     },
   };
 
-  constructor(readonly id: string) {
+  constructor(readonly id: string, state: VMState = "running") {
+    this.state = state;
     FakeVM.created.push(this);
   }
 
+  get destroyed() {
+    return this.state === "destroyed";
+  }
+
+  private assertRunning() {
+    if (this.state !== "running") throw new Error(`VM ${this.id} is ${this.state}`);
+  }
+
   async runCommand(cmd: string, args: string[]) {
-    if (this.destroyed) throw new Error("destroyed");
+    this.assertRunning();
     if (cmd === "python3" && args[1] === "-c") {
       // Egress probe: this VM has no outbound network.
       return { result: { stdout: "BLOCKED\n", stderr: "", exit_code: 0 } };
     }
     if (cmd === "timeout" && args.at(-1) === "/tmp/sealed-runner.py") {
+      if (!args.includes("--signal=KILL")) throw new Error("runner must be time-bounded");
       const runner = this.stored.get("/tmp/sealed-runner.py");
       const code = this.stored.get("/tmp/sealed-analysis.py");
-      const csv = this.stored.get("/tmp/sealed-dataset.csv");
-      if (typeof runner !== "string" || !runner.includes('namespace["result"]')) throw new Error("no runner");
-      if (typeof code !== "string" || !(csv instanceof ArrayBuffer)) throw new Error("missing inputs");
+      const data = this.stored.get("/tmp/sealed-dataset");
+      const meta = this.stored.get("/tmp/sealed-dataset.json");
+      if (typeof runner !== "string" || !runner.includes("/tmp/sealed-dataset.json")) throw new Error("no runner");
+      if (typeof code !== "string" || !(data instanceof ArrayBuffer) || typeof meta !== "string") {
+        throw new Error("missing inputs");
+      }
+      // The runner creates the table named in the metadata; the generated
+      // SQL targets the catalog's tableName, so the two must agree.
+      const { tableName, format } = JSON.parse(meta) as { tableName: string; format: string };
+      if (format !== "csv" || tableName !== COFFEE_DATASET.tableName || !code.includes(`FROM ${tableName}`)) {
+        return { result: { stdout: "", stderr: "", exit_code: 1 } };
+      }
       this.ranAnalysis = true;
-      const stdout = simulateAnalysis(code, new TextDecoder().decode(csv));
+      if (FakeVM.analysisExitCode !== 0) {
+        return { result: { stdout: "", stderr: "", exit_code: FakeVM.analysisExitCode } };
+      }
+      const stdout = simulateAnalysis(code, new TextDecoder().decode(data));
       return { result: { stdout, stderr: "", exit_code: 0 } };
     }
     return { result: { stdout: "", stderr: "", exit_code: 127 } };
   }
 
-  async pause() {}
+  async pause() {
+    this.assertRunning();
+    this.state = "paused";
+  }
   async waitUntilPaused() {}
 
   async fork() {
-    const child = new FakeVM(`${this.id}-child${FakeVM.created.length}`);
+    if (this.state !== "paused") throw new Error("only paused snapshots can be forked");
+    const child = new FakeVM(`${this.id}-child${FakeVM.created.length}`, "forking");
     for (const [k, v] of this.stored) child.stored.set(k, v);
     return child;
   }
 
+  async waitUntilRunning() {
+    if (this.state === "forking") this.state = "running";
+    this.assertRunning();
+  }
+
   async destroy() {
-    this.destroyed = true;
+    this.state = "destroyed";
   }
   async waitUntilDestroyed() {}
 }
@@ -172,11 +211,13 @@ function claudeReturning(code: string) {
 
 function setup(code: string) {
   FakeVM.created = [];
+  FakeVM.analysisExitCode = 0;
   const store = new InMemoryJobStore();
   const authorizer = new SnapshotAuthorizer(store);
   const payments = new FakePayments();
   const claude = claudeReturning(code);
   const events: AgentEvent[] = [];
+  const datasets = new StaticDatasetCatalog([COFFEE_DATASET]);
   const sandbox = new CreateOSRuntime({
     client: fakeClient,
     shape: "s-1vcpu-1gb",
@@ -184,13 +225,14 @@ function setup(code: string) {
     egress: ["pypi.org"],
     verifyIsolation: verifyEgressBlocked,
     authorizeExecution: authorizer.authorize,
+    resolveTableName: catalogTableNameResolver(datasets),
     options: { timeoutMs: 30_000, maxRetries: 0 },
   });
   setAgentRuntime({
     store,
     deps: {
       store,
-      datasets: new StaticDatasetCatalog([COFFEE_DATASET]),
+      datasets,
       payments,
       sandbox,
       policy: new AggregateOnlyOutputPolicy(),
@@ -257,7 +299,7 @@ describe("question -> generated Python -> sandbox -> validated result", () => {
 
     // The real dataset bytes went into the VM; every VM was destroyed.
     const root = FakeVM.created[0];
-    const uploaded = new Uint8Array(root.stored.get("/tmp/sealed-dataset.csv") as ArrayBuffer);
+    const uploaded = new Uint8Array(root.stored.get("/tmp/sealed-dataset") as ArrayBuffer);
     expect(Buffer.from(uploaded).equals(readFileSync(COFFEE_DATASET.path))).toBe(true);
     expect(FakeVM.created.every((vm) => vm.destroyed)).toBe(true);
     expect(FakeVM.created.some((vm) => vm.ranAnalysis)).toBe(true);
@@ -292,6 +334,17 @@ describe("question -> generated Python -> sandbox -> validated result", () => {
     const done = await waitForTerminal(job.id);
     expect(done.status).toBe("rejected");
     expect(done.result).toBeUndefined();
+  });
+
+  it("reports execution_failed when the sandbox kills a runaway script", async () => {
+    const { payments } = setup(REVENUE_BY_CATEGORY);
+    FakeVM.analysisExitCode = 137;
+    const job = await submitAndPay("Which drink categories earn the most revenue?", payments);
+
+    const done = await waitForTerminal(job.id);
+    expect(done.status).toBe("execution_failed");
+    expect(done.result).toBeUndefined();
+    expect(FakeVM.created.every((vm) => vm.destroyed)).toBe(true);
   });
 
   it("validates API input", async () => {

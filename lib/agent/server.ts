@@ -7,7 +7,7 @@ import { CreateOSRuntime, type CreateOSSandbox } from "../sandbox/createos";
 import { AggregateOnlyOutputPolicy, DEFAULT_OUTPUT_POLICY_OPTIONS } from "../security";
 import { DEMO_CATALOG } from "./catalog";
 import { ClaudeCodeGenerator, type CodeGenerator } from "./codegen";
-import { StaticDatasetCatalog } from "./datasets";
+import { StaticDatasetCatalog, type DatasetCatalog } from "./datasets";
 import { SnapshotAuthorizer } from "./executionAuth";
 import { InMemoryJobStore, type JobStore } from "./jobStore";
 import { confirmPayment, executeJob, failPayment, type AgentDeps } from "./orchestrator";
@@ -61,7 +61,19 @@ export async function verifyEgressBlocked(sandbox: CreateOSSandbox): Promise<voi
   }
 }
 
-export function createSandboxRuntime(authorizer: SnapshotAuthorizer): SandboxRuntime {
+/** Table names come from the trusted catalog so the runner and the generated SQL agree. */
+export function catalogTableNameResolver(catalog: DatasetCatalog) {
+  return async (datasetId: string): Promise<string> => {
+    const dataset = await catalog.get(datasetId);
+    if (!dataset) throw new Error("Unknown dataset");
+    return dataset.tableName;
+  };
+}
+
+export function createSandboxRuntime(
+  authorizer: SnapshotAuthorizer,
+  catalog: DatasetCatalog
+): SandboxRuntime {
   const egress = requireEnv("SEALED_CREATEOS_EGRESS")
     .split(",")
     .map((rule) => rule.trim())
@@ -77,6 +89,7 @@ export function createSandboxRuntime(authorizer: SnapshotAuthorizer): SandboxRun
     egress,
     verifyIsolation: verifyEgressBlocked,
     authorizeExecution: authorizer.authorize,
+    resolveTableName: catalogTableNameResolver(catalog),
     options: { timeoutMs: 30_000, maxRetries: 0 },
   });
 }
@@ -89,9 +102,10 @@ export interface AgentRuntime {
 function buildRuntime(): AgentRuntime {
   const store = new InMemoryJobStore();
   const authorizer = new SnapshotAuthorizer(store);
+  const datasets = new StaticDatasetCatalog(DEMO_CATALOG);
 
   const payments = lazy(() => createPaymentProvider());
-  const sandbox = lazy(() => createSandboxRuntime(authorizer));
+  const sandbox = lazy(() => createSandboxRuntime(authorizer, datasets));
   const codegen = lazy(() => new ClaudeCodeGenerator());
 
   const lazyPayments: PaymentProvider = {
@@ -107,7 +121,7 @@ function buildRuntime(): AgentRuntime {
 
   const deps: AgentDeps = {
     store,
-    datasets: new StaticDatasetCatalog(DEMO_CATALOG),
+    datasets,
     payments: lazyPayments,
     sandbox: lazySandbox,
     policy: new AggregateOnlyOutputPolicy(),
