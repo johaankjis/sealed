@@ -635,4 +635,68 @@ describe("POST /api/webhooks/stripe", () => {
     expect(res.status).toBe(200);
     expect((await ctx.store.get(job.id))?.status).toBe("payment_failed");
   });
+
+  it("releases claim and returns 500 when onPaidJobConfirmed fails so a webhook retry succeeds without duplicate execution", async () => {
+    const ctx = setupTestContext();
+    const { job, sessionId } = await createPendingJob(ctx);
+
+    let callCount = 0;
+    ctx.onPaidJobConfirmed.mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        throw new Error("transient execution trigger failure");
+      }
+    });
+
+    const { payload, signature } = signWebhookEvent({
+      id: "evt_route_retry_1",
+      object: "event",
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: sessionId,
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          amount_total: COFFEE_DATASET.priceCents,
+          currency: "usd",
+          client_reference_id: job.id,
+          metadata: { jobId: job.id },
+        },
+      },
+    });
+
+    // First delivery fails in callback -> returns 500 and releases claim
+    const firstRes = await stripeWebhookPost(
+      makeWebhookRequest(payload, signature)
+    );
+    expect(firstRes.status).toBe(500);
+    expect(ctx.onPaidJobConfirmed).toHaveBeenCalledTimes(1);
+
+    // Retry of the same webhook event succeeds and claims once
+    const retryRes = await stripeWebhookPost(
+      makeWebhookRequest(payload, signature)
+    );
+    expect(retryRes.status).toBe(200);
+    expect(await retryRes.json()).toEqual({
+      received: true,
+      duplicate: false,
+      jobId: job.id,
+      status: "paid",
+    });
+    expect(ctx.onPaidJobConfirmed).toHaveBeenCalledTimes(2);
+
+    // Subsequent delivery after success is deduplicated
+    const duplicateRes = await stripeWebhookPost(
+      makeWebhookRequest(payload, signature)
+    );
+    expect(duplicateRes.status).toBe(200);
+    expect(await duplicateRes.json()).toEqual({
+      received: true,
+      duplicate: true,
+      jobId: job.id,
+      status: "paid",
+    });
+    expect(ctx.onPaidJobConfirmed).toHaveBeenCalledTimes(2);
+  });
 });

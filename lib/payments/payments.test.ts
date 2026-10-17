@@ -450,6 +450,174 @@ describe("PaymentExecutionGate (Idempotency & Pre-Execution Security Boundary)",
       reason: "already_claimed",
     });
   });
+
+  it("rolls back event and job claims when onPaidJobClaimed throws so retries succeed without duplicate execution", async () => {
+    const gate = new PaymentExecutionGate();
+    let attempts = 0;
+    const onPaidJobClaimed = vi.fn().mockImplementation(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("transient execution startup failure");
+      }
+    });
+
+    const { payload, signature } = createSignedWebhookPayload({
+      id: "evt_retry_callback_200",
+      object: "event",
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_retry_callback_200",
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          metadata: { jobId: "job_retry_callback_200" },
+        },
+      },
+    });
+
+    // First attempt: callback throws -> event and job claims must be rolled back
+    await expect(
+      gate.handleWebhook(payload, signature, {
+        webhookSecret: TEST_WEBHOOK_SECRET,
+        onPaidJobClaimed,
+      })
+    ).rejects.toThrow("transient execution startup failure");
+
+    expect(gate.isJobClaimed("job_retry_callback_200")).toBe(false);
+    expect(gate.isEventProcessed("evt_retry_callback_200")).toBe(false);
+
+    // Second attempt (retry of the exact same webhook event): succeeds and claims job
+    const retryResult = await gate.handleWebhook(payload, signature, {
+      webhookSecret: TEST_WEBHOOK_SECRET,
+      onPaidJobClaimed,
+    });
+
+    expect(retryResult.duplicateEvent).toBe(false);
+    expect(retryResult.claimedForExecution).toBe(true);
+    expect(gate.isJobClaimed("job_retry_callback_200")).toBe(true);
+    expect(gate.isEventProcessed("evt_retry_callback_200")).toBe(true);
+    expect(onPaidJobClaimed).toHaveBeenCalledTimes(2);
+
+    // Third attempt after success: deduplicated, callback not invoked again
+    const afterSuccess = await gate.handleWebhook(payload, signature, {
+      webhookSecret: TEST_WEBHOOK_SECRET,
+      onPaidJobClaimed,
+    });
+
+    expect(afterSuccess.duplicateEvent).toBe(true);
+    expect(afterSuccess.claimedForExecution).toBe(false);
+    expect(onPaidJobClaimed).toHaveBeenCalledTimes(2);
+  });
+
+  it("prevents concurrent duplicate execution while onPaidJobClaimed is in-flight", async () => {
+    const gate = new PaymentExecutionGate();
+    let resolveCallback!: () => void;
+    const callbackBarrier = new Promise<void>((resolve) => {
+      resolveCallback = resolve;
+    });
+    const onPaidJobClaimed = vi.fn().mockImplementation(() => callbackBarrier);
+
+    const firstEvent = createSignedWebhookPayload({
+      id: "evt_concurrent_1",
+      object: "event",
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_concurrent_1",
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          metadata: { jobId: "job_concurrent_1" },
+        },
+      },
+    });
+
+    const secondEvent = createSignedWebhookPayload({
+      id: "evt_concurrent_2",
+      object: "event",
+      type: "checkout.session.async_payment_succeeded",
+      data: {
+        object: {
+          id: "cs_concurrent_1",
+          object: "checkout.session",
+          status: "complete",
+          payment_status: "paid",
+          metadata: { jobId: "job_concurrent_1" },
+        },
+      },
+    });
+
+    const firstPromise = gate.handleWebhook(
+      firstEvent.payload,
+      firstEvent.signature,
+      {
+        webhookSecret: TEST_WEBHOOK_SECRET,
+        onPaidJobClaimed,
+      }
+    );
+
+    const secondResult = await gate.handleWebhook(
+      secondEvent.payload,
+      secondEvent.signature,
+      {
+        webhookSecret: TEST_WEBHOOK_SECRET,
+        onPaidJobClaimed,
+      }
+    );
+
+    expect(secondResult.claimedForExecution).toBe(false);
+    expect(onPaidJobClaimed).toHaveBeenCalledTimes(1);
+
+    resolveCallback();
+    const firstResult = await firstPromise;
+    expect(firstResult.claimedForExecution).toBe(true);
+    expect(onPaidJobClaimed).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back event lock when onPaymentFailed throws so retries are not suppressed", async () => {
+    const gate = new PaymentExecutionGate();
+    let attempts = 0;
+    const onPaymentFailed = vi.fn().mockImplementation(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("store failure on mark_failed");
+      }
+    });
+
+    const { payload, signature } = createSignedWebhookPayload({
+      id: "evt_failed_retry_1",
+      object: "event",
+      type: "checkout.session.expired",
+      data: {
+        object: {
+          id: "cs_failed_retry_1",
+          object: "checkout.session",
+          status: "expired",
+          payment_status: "unpaid",
+          metadata: { jobId: "job_failed_retry_1" },
+        },
+      },
+    });
+
+    await expect(
+      gate.handleWebhook(payload, signature, {
+        webhookSecret: TEST_WEBHOOK_SECRET,
+        onPaymentFailed,
+      })
+    ).rejects.toThrow("store failure on mark_failed");
+
+    expect(gate.isEventProcessed("evt_failed_retry_1")).toBe(false);
+
+    const retryResult = await gate.handleWebhook(payload, signature, {
+      webhookSecret: TEST_WEBHOOK_SECRET,
+      onPaymentFailed,
+    });
+
+    expect(retryResult.duplicateEvent).toBe(false);
+    expect(gate.isEventProcessed("evt_failed_retry_1")).toBe(true);
+    expect(onPaymentFailed).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("Stripe Connect Onboarding & Split Helpers", () => {
