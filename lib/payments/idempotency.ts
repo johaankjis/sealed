@@ -59,14 +59,21 @@ export function assertPaymentVerified(
 
 /**
  * Coordinates webhook deduplication, payment verification recording, and atomic
- * single-execution job claims so a paid query is executed at most once and never
- * before payment verification.
+ * single-execution job claims within a single Node.js process so a paid query
+ * is executed at most once and never before payment verification.
+ *
+ * Durability limitation: This class stores state in process memory (`Set`/`Map`).
+ * It does NOT survive process restarts or coordinate across multiple server
+ * instances; production deployments require durable storage (e.g., PostgreSQL
+ * unique event log + atomic `UPDATE ... WHERE status = 'paid'` claim).
  */
 export class PaymentExecutionGate {
   private readonly processedEventIds = new Set<string>();
+  private readonly inFlightEventIds = new Set<string>();
   private readonly verifiedPayments = new Map<string, PaymentVerification>();
   private readonly failedPayments = new Map<string, PaymentVerification>();
   private readonly claimedJobIds = new Set<string>();
+  private readonly inFlightJobIds = new Set<string>();
 
   /**
    * Records a verified payment result (`paid: true`) for a job.
@@ -105,10 +112,17 @@ export class PaymentExecutionGate {
   }
 
   /**
-   * Checks whether a job has already been claimed for sandbox execution.
+   * Checks whether a job is currently claimed (in-flight or completed) for sandbox execution.
    */
   isJobClaimed(jobId: string): boolean {
     return this.claimedJobIds.has(jobId.trim());
+  }
+
+  /**
+   * Checks whether a webhook `eventId` has completed processing.
+   */
+  isEventProcessed(eventId: string): boolean {
+    return this.processedEventIds.has(eventId.trim());
   }
 
   /**
@@ -151,6 +165,17 @@ export class PaymentExecutionGate {
   }
 
   /**
+   * Releases a previously acquired job claim when downstream execution initiation
+   * fails before completion, allowing a subsequent retry to claim the job.
+   */
+  releaseJobClaim(jobId: string): void {
+    const normalizedJobId = jobId?.trim();
+    if (!normalizedJobId) return;
+    this.claimedJobIds.delete(normalizedJobId);
+    this.inFlightJobIds.delete(normalizedJobId);
+  }
+
+  /**
    * Verifies payment directly via a `PaymentProvider` (`verifyPayment(sessionId)`),
    * enforces `expectedJobId`, and atomically claims the job for execution.
    */
@@ -169,6 +194,10 @@ export class PaymentExecutionGate {
    * Verifies a signed Stripe webhook payload, deduplicates by `event.id`, updates
    * payment status, and—if the event marks the job as paid—atomically claims the
    * job for execution at most once.
+   *
+   * Safe retry guarantee: `event.id` and `jobId` are held as in-flight locks while
+   * awaiting `onPaidJobClaimed` / `onPaymentFailed` (preventing concurrent duplicate
+   * execution), but are rolled back if the callback throws so retries are not suppressed.
    */
   async handleWebhook(
     rawBody: string | Buffer,
@@ -180,7 +209,10 @@ export class PaymentExecutionGate {
   ): Promise<WebhookDispatchResult> {
     const event = verifyStripeWebhook(rawBody, signatureHeader, options);
 
-    if (this.processedEventIds.has(event.eventId)) {
+    if (
+      this.processedEventIds.has(event.eventId) ||
+      this.inFlightEventIds.has(event.eventId)
+    ) {
       return {
         event,
         duplicateEvent: true,
@@ -188,30 +220,74 @@ export class PaymentExecutionGate {
       };
     }
 
-    this.processedEventIds.add(event.eventId);
-
     if (event.action === "mark_paid" && event.verification) {
+      const normalizedJobId = event.verification.jobId.trim();
       this.recordVerifiedPayment(event.verification);
-      const claim = this.claimPaidJob(event.verification.jobId);
 
-      if (claim.claimed && options.onPaidJobClaimed) {
-        await options.onPaidJobClaimed(event.verification);
+      if (this.claimedJobIds.has(normalizedJobId)) {
+        // If the job claim already finished on a prior event, mark this event processed.
+        // If the job is still in-flight on another concurrent call, do not mark this
+        // event processed yet so it can retry if the in-flight call fails.
+        if (!this.inFlightJobIds.has(normalizedJobId)) {
+          this.processedEventIds.add(event.eventId);
+        }
+        return {
+          event,
+          duplicateEvent: false,
+          claimedForExecution: false,
+        };
       }
 
-      return {
-        event,
-        duplicateEvent: false,
-        claimedForExecution: claim.claimed,
-      };
+      this.inFlightEventIds.add(event.eventId);
+      this.inFlightJobIds.add(normalizedJobId);
+      this.claimedJobIds.add(normalizedJobId);
+
+      try {
+        if (options.onPaidJobClaimed) {
+          await options.onPaidJobClaimed(event.verification);
+        }
+        this.processedEventIds.add(event.eventId);
+        return {
+          event,
+          duplicateEvent: false,
+          claimedForExecution: true,
+        };
+      } catch (err) {
+        this.claimedJobIds.delete(normalizedJobId);
+        throw err;
+      } finally {
+        this.inFlightEventIds.delete(event.eventId);
+        this.inFlightJobIds.delete(normalizedJobId);
+      }
     }
 
     if (event.action === "mark_failed" && event.verification) {
-      this.recordFailedPayment(event.verification);
-      if (options.onPaymentFailed) {
-        await options.onPaymentFailed(event.verification);
+      const normalizedJobId = event.verification.jobId.trim();
+      const hadFailedBefore = this.failedPayments.has(normalizedJobId);
+      this.inFlightEventIds.add(event.eventId);
+
+      try {
+        this.recordFailedPayment(event.verification);
+        if (options.onPaymentFailed) {
+          await options.onPaymentFailed(event.verification);
+        }
+        this.processedEventIds.add(event.eventId);
+        return {
+          event,
+          duplicateEvent: false,
+          claimedForExecution: false,
+        };
+      } catch (err) {
+        if (!hadFailedBefore) {
+          this.failedPayments.delete(normalizedJobId);
+        }
+        throw err;
+      } finally {
+        this.inFlightEventIds.delete(event.eventId);
       }
     }
 
+    this.processedEventIds.add(event.eventId);
     return {
       event,
       duplicateEvent: false,

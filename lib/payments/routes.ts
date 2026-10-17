@@ -259,7 +259,8 @@ export async function handleCheckoutPost(
  * 3. Paid status (`session.payment_status === "paid"`, `session.status !== "expired"`, plus provider verification).
  * 4. Amount (`session.amount_total === dataset.priceCents`).
  * 5. Currency (`session.currency === "usd"`).
- * Then idempotently transitions the job to `"paid"` in Claude's `JobStore`.
+ * Then idempotently transitions the job to `"paid"` in Claude's `JobStore` and invokes
+ * `onPaidJobConfirmed`, rolling back the claim if the callback fails so retries succeed.
  */
 export async function handleStripeWebhookPost(
   request: Request,
@@ -338,6 +339,7 @@ export async function handleStripeWebhookPost(
   }
 
   const processedEvents = getProcessedWebhookEvents();
+  const gate = getWebhookGate();
 
   if (isFailureEvent) {
     if (processedEvents.has(event.eventId)) {
@@ -352,26 +354,33 @@ export async function handleStripeWebhookPost(
       );
     }
 
-    const updated = await failPayment(
-      { store: deps.store },
-      session.sessionId
-    );
-    processedEvents.add(event.eventId);
-    getWebhookGate().recordFailedPayment({
-      jobId: jobById.id,
-      paid: false,
-      stripeSessionId: session.sessionId,
-    });
-
-    return Response.json(
-      {
-        received: true,
-        duplicate: false,
+    try {
+      const updated = await failPayment(
+        { store: deps.store },
+        session.sessionId
+      );
+      processedEvents.add(event.eventId);
+      gate.recordFailedPayment({
         jobId: jobById.id,
-        status: updated?.status ?? jobById.status,
-      },
-      { status: 200 }
-    );
+        paid: false,
+        stripeSessionId: session.sessionId,
+      });
+
+      return Response.json(
+        {
+          received: true,
+          duplicate: false,
+          jobId: jobById.id,
+          status: updated?.status ?? jobById.status,
+        },
+        { status: 200 }
+      );
+    } catch {
+      return Response.json(
+        { error: "Failed to record payment failure" },
+        { status: 500 }
+      );
+    }
   }
 
   // Completion event: verify paid status, amount, and currency before marking paid
@@ -415,7 +424,7 @@ export async function handleStripeWebhookPost(
     );
   }
 
-  // Deduplicate repeated webhook deliveries by eventId or already-paid job status
+  // Deduplicate repeated webhook deliveries by eventId or already-claimed job status
   if (processedEvents.has(event.eventId)) {
     return Response.json(
       {
@@ -429,10 +438,10 @@ export async function handleStripeWebhookPost(
   }
 
   if (
-    jobById.status === "paid" ||
     jobById.status === "running" ||
     jobById.status === "validating" ||
-    jobById.status === "completed"
+    jobById.status === "completed" ||
+    (jobById.status === "paid" && gate.isJobClaimed(jobById.id))
   ) {
     processedEvents.add(event.eventId);
     return Response.json(
@@ -446,7 +455,7 @@ export async function handleStripeWebhookPost(
     );
   }
 
-  if (jobById.status !== "payment_pending") {
+  if (jobById.status !== "payment_pending" && jobById.status !== "paid") {
     return Response.json(
       {
         error: `Job "${jobById.id}" cannot be marked paid from status "${jobById.status}"`,
@@ -515,37 +524,55 @@ export async function handleStripeWebhookPost(
     );
   }
 
+  gate.recordVerifiedPayment(providerVerification);
+  const claim = gate.claimPaidJob(jobById.id);
+  if (!claim.claimed) {
+    return Response.json(
+      {
+        received: true,
+        duplicate: true,
+        jobId: jobById.id,
+        status: jobById.status,
+      },
+      { status: 200 }
+    );
+  }
+
   const preVerifiedProvider: PaymentProvider = {
     createCheckout: (req) => deps.payments.createCheckout(req),
     verifyPayment: async () => providerVerification,
   };
 
-  const updated = await confirmPayment(
-    {
-      store: deps.store,
-      payments: preVerifiedProvider,
-      onEvent: deps.onEvent,
-    },
-    session.sessionId
-  );
+  try {
+    const updated = await confirmPayment(
+      {
+        store: deps.store,
+        payments: preVerifiedProvider,
+        onEvent: deps.onEvent,
+      },
+      session.sessionId
+    );
 
-  processedEvents.add(event.eventId);
+    if (updated?.status === "paid" && deps.onPaidJobConfirmed) {
+      await deps.onPaidJobConfirmed(updated);
+    }
 
-  const gate = getWebhookGate();
-  gate.recordVerifiedPayment(providerVerification);
-  const claim = gate.claimPaidJob(jobById.id);
+    processedEvents.add(event.eventId);
 
-  if (claim.claimed && updated?.status === "paid" && deps.onPaidJobConfirmed) {
-    void Promise.resolve(deps.onPaidJobConfirmed(updated));
+    return Response.json(
+      {
+        received: true,
+        duplicate: false,
+        jobId: jobById.id,
+        status: updated?.status ?? "paid",
+      },
+      { status: 200 }
+    );
+  } catch {
+    gate.releaseJobClaim(jobById.id);
+    return Response.json(
+      { error: "Webhook payment confirmation handler failed" },
+      { status: 500 }
+    );
   }
-
-  return Response.json(
-    {
-      received: true,
-      duplicate: !claim.claimed,
-      jobId: jobById.id,
-      status: updated?.status ?? "paid",
-    },
-    { status: 200 }
-  );
 }
