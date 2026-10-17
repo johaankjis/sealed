@@ -15,24 +15,30 @@ export const dataset: DatasetDescriptor = {
   name: "Retail orders",
   description: "Orders from a mid-size retailer",
   path: "/data/retail.parquet",
-  tableName: "orders",
+  tableName: "dataset",
   columns: [
     { name: "region", type: "VARCHAR" },
     { name: "amount", type: "DOUBLE" },
     { name: "customer_email", type: "VARCHAR" },
   ],
+  rowCount: 1000,
   priceCents: 500,
 };
 
-export const safeCode = `import duckdb, json
-rows = con.execute("SELECT region, COUNT(*) AS n, AVG(amount) AS avg FROM orders GROUP BY region HAVING COUNT(*) >= 10").fetchall()
-print(json.dumps({"columns": ["region", "n", "avg"], "rows": [dict(region=r[0], n=r[1], avg=r[2]) for r in rows], "groupSizes": [r[1] for r in rows]}))`;
+export const safeCode = `rows = con.execute(
+    "SELECT region, AVG(amount) AS avg, COUNT(*) AS n FROM dataset GROUP BY region HAVING COUNT(*) >= 10"
+).fetchall()
+result = {
+    "columns": ["region", "avg"],
+    "rows": [{"region": r[0], "avg": round(r[1], 2)} for r in rows],
+    "groupSizes": [r[2] for r in rows],
+}`;
 
 export const execution: ExecutionResult = {
-  columns: ["region", "n", "avg"],
+  columns: ["region", "avg"],
   rows: [
-    { region: "EU", n: 40, avg: 12.5 },
-    { region: "US", n: 60, avg: 20 },
+    { region: "EU", avg: 12.5 },
+    { region: "US", avg: 20 },
   ],
   groupSizes: [40, 60],
 };

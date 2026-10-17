@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { confirmPayment, createJob, executeJob, failPayment, startCheckout } from "../orchestrator";
+import { SnapshotAuthorizer } from "../executionAuth";
 import { execution, makeDeps } from "./fakes";
 
 async function paidJob() {
@@ -24,7 +25,10 @@ describe("job creation and payment", () => {
     const stored = await deps.store.get(job.id);
     expect(stored?.status).toBe("payment_pending");
     expect(stored?.stripeSessionId).toBe(checkout.sessionId);
-    await expect(startCheckout(deps, job.id)).rejects.toThrow();
+    // Retrying checkout returns the same session instead of creating another.
+    expect(await startCheckout(deps, job.id)).toEqual(checkout);
+    await deps.store.transition(job.id, "payment_pending", "payment_failed");
+    await expect(startCheckout(deps, job.id)).rejects.toThrow("not awaiting checkout");
   });
 
   it("only marks paid when the provider verifies payment", async () => {
@@ -144,5 +148,53 @@ describe("executeJob", () => {
     expect(job.status).toBe("execution_failed");
     expect(job.errorCode).toBe("generation_failed");
     expect(deps.sandbox.executed).toHaveLength(0);
+  });
+
+  it("fails closed when group sizes are missing, without consulting the policy", async () => {
+    const { deps, jobId } = await paidJob();
+    deps.sandbox.executeImpl = async () => ({ columns: execution.columns, rows: execution.rows });
+    let policyCalls = 0;
+    const validate = deps.policy.validate.bind(deps.policy);
+    deps.policy.validate = async (r) => {
+      policyCalls++;
+      return validate(r);
+    };
+    const job = await executeJob(deps, jobId);
+    expect(job.status).toBe("rejected");
+    expect(job.result).toBeUndefined();
+    expect(policyCalls).toBe(0);
+    expect(deps.codegen.requests[1].previousFailures[0]).toContain("missing groupSizes");
+  });
+
+  it("rejects group sizes that exceed the dataset row count", async () => {
+    const { deps, jobId } = await paidJob();
+    deps.sandbox.executeImpl = async () => ({ ...execution, groupSizes: [900, 900] });
+    const job = await executeJob(deps, jobId);
+    expect(job.status).toBe("rejected");
+    expect(deps.codegen.requests[1].previousFailures[0]).toContain("inconsistent with the dataset size");
+  });
+
+  it("binds the snapshot to the job only while it is running", async () => {
+    const { deps, jobId } = await paidJob();
+    const authorizer = new SnapshotAuthorizer(deps.store);
+    const seen: boolean[] = [];
+    deps.sandbox.executeImpl = async () => {
+      seen.push(await authorizer.authorize(deps.sandbox.prepared[0]));
+      return execution;
+    };
+    const job = await executeJob({ ...deps, snapshots: authorizer }, jobId);
+    expect(job.status).toBe("completed");
+    expect(seen).toEqual([true]);
+    expect(await authorizer.authorize(deps.sandbox.prepared[0])).toBe(false);
+    expect(await authorizer.authorize("unknown")).toBe(false);
+  });
+
+  it("refuses a job marked paid without a Stripe session", async () => {
+    const { deps } = makeDeps();
+    const job = await createJob(deps, { datasetId: "retail", question: "q" });
+    await deps.store.transition(job.id, "created", "payment_pending");
+    await deps.store.transition(job.id, "payment_pending", "paid");
+    await expect(executeJob(deps, job.id)).rejects.toThrow("Payment could not be verified");
+    expect(deps.sandbox.prepared).toHaveLength(0);
   });
 });

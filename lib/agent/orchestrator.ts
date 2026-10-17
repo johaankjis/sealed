@@ -2,9 +2,12 @@ import type { QueryJob } from "../../contracts/job";
 import type { CheckoutResponse, PaymentProvider } from "../../contracts/payments";
 import type { ApprovedResult, ExecutionResult, OutputPolicy } from "../../contracts/results";
 import type { SandboxExecutionOptions, SandboxRuntime } from "../../contracts/sandbox";
+import { canExecuteJob, validateQuestion } from "../security";
 import { checkGeneratedCode } from "./codeCheck";
 import type { CodeGenerator, GeneratedAnalysis } from "./codegen";
 import type { DatasetCatalog } from "./datasets";
+import type { SnapshotBindings } from "./executionAuth";
+import { checkGroupSizeEvidence } from "./groupSizes";
 import type { JobStore } from "./jobStore";
 
 /** Buyer-safe error codes stored on QueryJob.errorCode. */
@@ -39,11 +42,20 @@ export interface AgentDeps {
   sandbox: SandboxRuntime;
   policy: OutputPolicy;
   codegen: CodeGenerator;
+  /** Agent-level budget per attempt and generation retries (not sandbox retries). */
   options?: Partial<SandboxExecutionOptions>;
+  /** Lets the sandbox map a snapshot back to its job (see SnapshotAuthorizer). */
+  snapshots?: SnapshotBindings;
+  /** Must match the OutputPolicy's minimum group size. */
+  minGroupSize?: number;
   onEvent?: (event: AgentEvent) => void;
 }
 
-const DEFAULT_OPTIONS: SandboxExecutionOptions = { timeoutMs: 60_000, maxRetries: 2 };
+// The sandbox bounds each run itself (~35s plus fork/teardown). This outer
+// timeout is a backstop and must stay longer, or destroy() would find the
+// snapshot still busy.
+const DEFAULT_OPTIONS: SandboxExecutionOptions = { timeoutMs: 180_000, maxRetries: 2 };
+const DEFAULT_MIN_GROUP_SIZE = 10;
 const MAX_QUESTION_LENGTH = 1000;
 const MAX_FEEDBACK_LENGTH = 300;
 
@@ -61,10 +73,11 @@ export async function createJob(
   deps: Pick<AgentDeps, "store" | "datasets">,
   input: { datasetId: string; question: string }
 ): Promise<QueryJob> {
-  const question = input.question.trim();
-  if (!question || question.length > MAX_QUESTION_LENGTH) {
-    throw new AgentError("invalid_request", "Question must be 1-1000 characters");
+  const checked = validateQuestion(input.question, { maxLength: MAX_QUESTION_LENGTH });
+  if (!checked.ok || !checked.sanitized) {
+    throw new AgentError("invalid_request", checked.reason ?? "Invalid question");
   }
+  const question = checked.sanitized;
   if (!(await deps.datasets.get(input.datasetId))) {
     throw new AgentError("dataset_not_found", "Unknown dataset");
   }
@@ -76,17 +89,29 @@ export async function startCheckout(
   jobId: string
 ): Promise<CheckoutResponse> {
   const job = await deps.store.get(jobId);
-  if (!job || job.status !== "created") {
+  if (!job) throw new AgentError("invalid_request", "Unknown job");
+  if (job.status !== "created" && job.status !== "payment_pending") {
     throw new AgentError("invalid_state", "Job is not awaiting checkout");
   }
   const dataset = await deps.datasets.get(job.datasetId);
   if (!dataset) throw new AgentError("dataset_not_found", "Unknown dataset");
 
+  // Price always comes from the trusted catalog, never from the buyer.
   const checkout = await deps.payments.createCheckout({
     jobId,
     amountCents: dataset.priceCents,
     currency: "usd",
   });
+
+  // Retrying checkout: the provider is idempotent per job, so it must hand
+  // back the same session we already recorded.
+  if (job.status === "payment_pending") {
+    if (checkout.sessionId !== job.stripeSessionId) {
+      throw new AgentError("invalid_state", "Checkout session mismatch");
+    }
+    return checkout;
+  }
+
   const updated = await deps.store.transition(jobId, "created", "payment_pending", {
     stripeSessionId: checkout.sessionId,
   });
@@ -173,6 +198,9 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
   const existing = await store.get(jobId);
   if (!existing) throw new AgentError("invalid_request", "Unknown job");
   if (existing.status !== "paid") return existing;
+  if (!canExecuteJob(existing).allowed) {
+    throw new AgentError("payment_not_verified", "Payment could not be verified");
+  }
 
   // Never run without a verified payment, even if the store says "paid".
   if (
@@ -202,6 +230,7 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
   let snapshotId: string;
   try {
     snapshotId = await sandbox.prepareDataset(dataset.id, dataset.path);
+    deps.snapshots?.bind(snapshotId, jobId);
     emit({ type: "sandbox_prepared", jobId });
   } catch {
     return finish("running", "execution_failed", { errorCode: "sandbox_unavailable" });
@@ -247,9 +276,16 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
       }
 
       await store.transition(jobId, "running", "validating");
+      const evidenceProblem = checkGroupSizeEvidence(execution, {
+        minGroupSize: deps.minGroupSize ?? DEFAULT_MIN_GROUP_SIZE,
+        datasetRowCount: dataset.rowCount,
+      });
       let decision: Awaited<ReturnType<OutputPolicy["validate"]>>;
       try {
-        decision = await policy.validate(execution);
+        // Fail closed without trusted group sizes; the policy is not consulted.
+        decision = evidenceProblem
+          ? { approved: false, reason: evidenceProblem }
+          : await policy.validate(execution);
       } catch {
         // Fail closed: if the policy cannot decide, nothing is released.
         return finish("validating", "execution_failed", { errorCode: "execution_failed" });
@@ -282,6 +318,7 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
     // means the last attempt failed before validation.
     return finish("running", "execution_failed", { errorCode: lastError });
   } finally {
+    deps.snapshots?.unbind(snapshotId);
     try {
       await sandbox.destroy(snapshotId);
       emit({ type: "sandbox_destroyed", jobId });

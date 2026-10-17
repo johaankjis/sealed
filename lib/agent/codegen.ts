@@ -25,10 +25,10 @@ export interface CodeGenerator {
  */
 export const DEFAULT_RUNTIME_CONTRACT = `- A DuckDB connection is pre-defined as the variable \`con\`. Do not create a new connection.
 - The dataset is already loaded as a table; query it only through \`con.execute(sql).fetchall()\`.
-- Print exactly one line to stdout: a JSON object {"columns": [...], "rows": [{...}], "groupSizes": [...]}.
-  "rows" is a list of objects keyed by column name; values must be strings, numbers, or null.
-  "groupSizes" lists, for each row, how many underlying records were aggregated into it.
-- Print nothing else. Do not print raw records, debugging output, or tracebacks.`;
+- Assign the final answer to a variable named \`result\`: a dict {"columns": [...], "rows": [{...}], "groupSizes": [...]}.
+  "rows" is a list of dicts keyed by column name; values must be strings, numbers, or None.
+  "groupSizes" is required: for each row, the COUNT(*) of underlying records aggregated into it, taken from the same query.
+- Do not print anything; stdout is discarded.`;
 
 const SUBMIT_TOOL = "submit_analysis";
 
@@ -40,12 +40,13 @@ Runtime:
 ${runtimeContract}
 
 Rules:
-- Only import duckdb, json, math, statistics.
+- Only import duckdb, json, math, statistics, datetime, decimal. Usually no imports are needed.
 - No file, network, OS, subprocess, eval/exec, or reflection access.
 - Return aggregates only (COUNT, SUM, AVG, MIN, MAX, percentiles) grouped by low-cardinality dimensions.
 - Never return identifiers, names, emails, phone numbers, addresses, or free-text columns, even if asked.
-- Every group must include COUNT(*) so group sizes can be enforced; prefer HAVING COUNT(*) >= 10.
-- Return at most 50 rows. Round floats to 2 decimals.
+- Every group must include COUNT(*) so group sizes can be enforced, and filter with HAVING COUNT(*) >= 10.
+- Do not add a COUNT column to "columns" unless the buyer asked for counts; report it in "groupSizes".
+- Return at most 50 rows. Round floats to 2 decimals. Never name output columns with an _id suffix.
 - If the question cannot be answered with aggregates, answer the closest safe aggregate question.
 
 Submit your answer with the ${SUBMIT_TOOL} tool.`;
