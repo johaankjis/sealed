@@ -196,7 +196,22 @@ describe("POST /api/checkout", () => {
         url: `https://checkout.stripe.com/c/pay/cs_test_${params.client_reference_id}_${callCount}`,
       };
     });
-    const { store, datasets } = setupTestContext({ createSession });
+    const retrieveSession = vi.fn().mockImplementation(async (sessionId: string) => {
+      const jobId = sessionId.replace(/^cs_test_/, "").replace(/_\d+$/, "");
+      return {
+        id: sessionId,
+        status: "open",
+        payment_status: "unpaid",
+        amount_total: COFFEE_DATASET.priceCents,
+        currency: "usd",
+        client_reference_id: jobId,
+        metadata: { jobId },
+      };
+    });
+    const { store, datasets } = setupTestContext({
+      createSession,
+      retrieveSession,
+    });
     const job = await createJob(
       { store, datasets },
       { datasetId: COFFEE_DATASET.id, question: "Top categories?" }
@@ -212,9 +227,28 @@ describe("POST /api/checkout", () => {
 
     expect(secondBody).toEqual(firstBody);
     expect(createSession).toHaveBeenCalledTimes(1);
+    expect(retrieveSession).toHaveBeenCalledWith(firstBody.sessionId);
     const stored = await store.get(job.id);
     expect(stored?.status).toBe("payment_pending");
     expect(stored?.stripeSessionId).toBe(firstBody.sessionId);
+  });
+
+  it("returns 409 when retrying checkout for a session that is already completed/paid in Stripe", async () => {
+    // Default retrieveSession returns status: "complete" and payment_status: "paid"
+    const { store, datasets, createSession } = setupTestContext();
+    const job = await createJob(
+      { store, datasets },
+      { datasetId: COFFEE_DATASET.id, question: "Already paid in Stripe?" }
+    );
+
+    const first = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
+    expect(first.status).toBe(200);
+
+    const retryWhenPaid = await checkoutPost(
+      makeCheckoutRequest({ jobId: job.id })
+    );
+    expect(retryWhenPaid.status).toBe(409);
+    expect(createSession).toHaveBeenCalledTimes(1);
   });
 
   it("returns 409 when job is no longer awaiting checkout or if provider returns a mismatched session on retry", async () => {
