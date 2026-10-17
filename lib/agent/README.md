@@ -20,7 +20,7 @@ into the Next.js API routes.
 | --- | --- |
 | `POST /api/jobs` `{datasetId, question}` | Runs `validateQuestion` and checks the catalog. Returns `201` with a `QueryJob` (`created`). Never executes. |
 | `GET /api/jobs/:id` | Returns the buyer view (no `stripeSessionId`). If the job is `payment_pending`, asks Stripe about the **server-stored** session (throttled to once per 5s per job) and starts execution when it is paid. |
-| `POST /api/checkout` `{jobId}` | Served by lib/payments (`handleCheckoutPost`), which calls `startCheckout`. Prices the job from the catalog. `created -> payment_pending`. A repeat request gets `409`. |
+| `POST /api/checkout` `{jobId}` | Served by lib/payments (`handleCheckoutPost`), which calls `startCheckout`. Prices the job from the catalog. `created -> payment_pending`. A retry while `payment_pending` returns the *same* session, but only if Stripe confirms it belongs to the job and is still unpaid. Otherwise, and for paid, running, failed or completed jobs, the response is `409`. |
 
 No route accepts a session ID, a "paid" flag, or a price from the buyer.
 
@@ -92,4 +92,4 @@ the expected SQL result in TypeScript. Generated Python is never run on the host
 5. **Persistence.** The `InMemoryJobStore` is lost on restart. Postgres should implement `transition` as `UPDATE ... WHERE id=$1 AND status=$2 RETURNING *`.
 6. **Frontend catalog.** Only `downtown-coffee-sales` exists on the backend. The other listings in `components/datasets.ts` return `404` from `POST /api/jobs`.
 7. **Webhook route** is missing (see above).
-8. **Suggested contract additions** (not made): a shared `DatasetDescriptor`, and making `ExecutionResult.groupSizes` required.
+8. **Suggested contract additions** (not made): a shared `DatasetDescriptor`; making `ExecutionResult.groupSizes` required; and a way for `PaymentProvider` to report that a session is open, expired or complete. Without the last one, checkout retries rely on the `checkout.session.expired` webhook to move expired sessions to `payment_failed`.

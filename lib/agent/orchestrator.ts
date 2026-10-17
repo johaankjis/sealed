@@ -90,7 +90,8 @@ export async function startCheckout(
 ): Promise<CheckoutResponse> {
   const job = await deps.store.get(jobId);
   if (!job) throw new AgentError("invalid_request", "Unknown job");
-  // One checkout per job: lib/payments maps a repeat request to 409.
+  if (job.status === "payment_pending") return resumeCheckout(deps, job);
+  // paid, running, completed, failed, ...: lib/payments maps this to 409.
   if (job.status !== "created") {
     throw new AgentError("invalid_state", "Job is not awaiting checkout");
   }
@@ -108,6 +109,53 @@ export async function startCheckout(
     stripeSessionId: checkout.sessionId,
   });
   if (!updated) throw new AgentError("invalid_state", "Job changed during checkout");
+  return checkout;
+}
+
+/**
+ * Checkout retry for a job already in `payment_pending`. Returns the session
+ * recorded on the job, never a new one:
+ * 1. Ask the provider about the stored session before requesting anything,
+ *    and require it to belong to this job and still be unpaid. A paid session
+ *    is left for confirmPayment (webhook or poll) to process.
+ * 2. Re-request checkout. The provider is idempotent per job, so it must hand
+ *    back the same session ID; anything else is a mismatch and is refused.
+ * 3. Re-read the job so a concurrent payment or expiry wins.
+ *
+ * The PaymentProvider contract cannot report an expired-but-unpaid session.
+ * Expiry is handled by the `checkout.session.expired` webhook moving the job
+ * to `payment_failed`, after which retries get 409.
+ */
+async function resumeCheckout(
+  deps: Pick<AgentDeps, "store" | "datasets" | "payments">,
+  job: QueryJob
+): Promise<CheckoutResponse> {
+  const sessionId = job.stripeSessionId;
+  if (!sessionId) throw new AgentError("invalid_state", "Job has no checkout session");
+  const dataset = await deps.datasets.get(job.datasetId);
+  if (!dataset) throw new AgentError("dataset_not_found", "Unknown dataset");
+
+  const verification = await deps.payments.verifyPayment(sessionId);
+  if (verification.jobId !== job.id || verification.stripeSessionId !== sessionId) {
+    throw new AgentError("invalid_state", "Checkout session mismatch");
+  }
+  if (verification.paid) {
+    throw new AgentError("invalid_state", "Checkout session is already paid");
+  }
+
+  const checkout = await deps.payments.createCheckout({
+    jobId: job.id,
+    amountCents: dataset.priceCents,
+    currency: "usd",
+  });
+  if (checkout.sessionId !== sessionId) {
+    throw new AgentError("invalid_state", "Checkout session mismatch");
+  }
+
+  const current = await deps.store.get(job.id);
+  if (current?.status !== "payment_pending" || current.stripeSessionId !== sessionId) {
+    throw new AgentError("invalid_state", "Job changed during checkout");
+  }
   return checkout;
 }
 

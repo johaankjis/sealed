@@ -47,9 +47,14 @@ export class FakePayments implements PaymentProvider {
   paid = true;
   sessions = new Map<string, string>();
   verifyCalls = 0;
+  createCalls: CheckoutRequest[] = [];
+  /** Simulates a non-idempotent provider that mints a new session per call. */
+  idempotent = true;
 
   async createCheckout(request: CheckoutRequest) {
-    const sessionId = `cs_${request.jobId}`;
+    this.createCalls.push(request);
+    const suffix = this.idempotent ? "" : `_${this.createCalls.length}`;
+    const sessionId = `cs_${request.jobId}${suffix}`;
     this.sessions.set(sessionId, request.jobId);
     return { sessionId, checkoutUrl: `https://checkout.test/${sessionId}` };
   }

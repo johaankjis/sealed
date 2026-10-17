@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { confirmPayment, createJob, executeJob, failPayment, startCheckout } from "../orchestrator";
 import { SnapshotAuthorizer } from "../executionAuth";
+import type { QueryJob } from "../../../contracts/job";
 import { StaticDatasetCatalog } from "../datasets";
 import { dataset, execution, makeDeps } from "./fakes";
 
@@ -26,7 +27,86 @@ describe("job creation and payment", () => {
     const stored = await deps.store.get(job.id);
     expect(stored?.status).toBe("payment_pending");
     expect(stored?.stripeSessionId).toBe(checkout.sessionId);
+    expect(deps.payments.createCalls[0]).toEqual({ jobId: job.id, amountCents: 500, currency: "usd" });
+  });
+
+  describe("checkout retry while payment_pending", () => {
+    async function pendingJob() {
+      const ctx = makeDeps();
+      ctx.deps.payments.paid = false;
+      const job = await createJob(ctx.deps, { datasetId: "retail", question: "q" });
+      const checkout = await startCheckout(ctx.deps, job.id);
+      return { ...ctx, job, checkout };
+    }
+
+    it("returns the same verified, unpaid session", async () => {
+      const { deps, job, checkout } = await pendingJob();
+      expect(await startCheckout(deps, job.id)).toEqual(checkout);
+      expect(await startCheckout(deps, job.id)).toEqual(checkout);
+      const stored = await deps.store.get(job.id);
+      expect(stored?.status).toBe("payment_pending");
+      expect(stored?.stripeSessionId).toBe(checkout.sessionId);
+      expect(new Set(deps.payments.createCalls.map((c) => c.amountCents))).toEqual(new Set([500]));
+    });
+
+    it("refuses a session that is already paid and leaves the job for confirmPayment", async () => {
+      const { deps, job } = await pendingJob();
+      deps.payments.paid = true;
+      await expect(startCheckout(deps, job.id)).rejects.toThrow("already paid");
+      expect(deps.payments.createCalls).toHaveLength(1);
+      expect((await deps.store.get(job.id))?.status).toBe("payment_pending");
+    });
+
+    it("refuses when the provider hands back a different session", async () => {
+      const { deps, job, checkout } = await pendingJob();
+      deps.payments.idempotent = false;
+      await expect(startCheckout(deps, job.id)).rejects.toThrow("session mismatch");
+      expect((await deps.store.get(job.id))?.stripeSessionId).toBe(checkout.sessionId);
+    });
+
+    it("refuses before requesting checkout when the stored session belongs to another job", async () => {
+      const { deps, job } = await pendingJob();
+      deps.payments.sessions.set(`cs_${job.id}`, "other-job");
+      await expect(startCheckout(deps, job.id)).rejects.toThrow("session mismatch");
+      expect(deps.payments.createCalls).toHaveLength(1);
+    });
+
+    it("refuses a pending job with no recorded session", async () => {
+      const { deps } = makeDeps();
+      const job = await createJob(deps, { datasetId: "retail", question: "q" });
+      await deps.store.transition(job.id, "created", "payment_pending");
+      await expect(startCheckout(deps, job.id)).rejects.toThrow("no checkout session");
+      expect(deps.payments.createCalls).toHaveLength(0);
+    });
+
+    it("refuses if the job moves on while the retry is in flight", async () => {
+      const { deps, job } = await pendingJob();
+      const create = deps.payments.createCheckout.bind(deps.payments);
+      deps.payments.createCheckout = async (request) => {
+        const result = await create(request);
+        await deps.store.transition(job.id, "payment_pending", "payment_failed");
+        return result;
+      };
+      await expect(startCheckout(deps, job.id)).rejects.toThrow("Job changed during checkout");
+    });
+  });
+
+  it.each([
+    ["paid", ["payment_pending", "paid"]],
+    ["running", ["payment_pending", "paid", "running"]],
+    ["completed", ["payment_pending", "paid", "running", "validating", "completed"]],
+    ["payment_failed", ["payment_pending", "payment_failed"]],
+    ["execution_failed", ["payment_pending", "paid", "running", "execution_failed"]],
+  ] as const)("refuses checkout for a %s job", async (_label, path) => {
+    const { deps } = makeDeps();
+    const job = await createJob(deps, { datasetId: "retail", question: "q" });
+    let from: QueryJob["status"] = "created";
+    for (const to of path) {
+      await deps.store.transition(job.id, from, to, { stripeSessionId: `cs_${job.id}` });
+      from = to;
+    }
     await expect(startCheckout(deps, job.id)).rejects.toThrow("not awaiting checkout");
+    expect(deps.payments.createCalls).toHaveLength(0);
   });
 
   it("only marks paid when the provider verifies payment", async () => {
