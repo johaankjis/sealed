@@ -20,8 +20,9 @@ spend credits, and makes one Anthropic API call.
   template owned by the account with status `ready`, and DuckDB must be baked
   in. Built-in images such as `devbox:1` are refused. Nothing is installed at
   runtime. `SEALED_CREATEOS_EGRESS` must be non-empty (empty means allow all
-  in CreateOS) and must not contain `*` or the probe host. Every VM and fork runs
-  the real egress probe before any data or code is uploaded. The probe is
+  in CreateOS) and must not contain `*` or the probe host. Before any data or code is uploaded, every VM and fork
+  has its provider-side allowlist read back and compared exactly with the
+  configured rules (an empty list fails), then runs the real egress probe. The probe is
   evidence for one destination only, not a zero-egress guarantee.
 - **No payment bypass in the app.** The script approves a single in-process
   synthetic session (`live_synthetic_<run id>`) through `SyntheticRunPayments`,
@@ -73,7 +74,7 @@ SEALED_LIVE_REPORT=/tmp/sealed-coffee-live.json \
 node --experimental-transform-types lib/agent/live/coffee-live.ts --run --cli-auth
 ```
 Expected: about 2 VMs (snapshot plus one fork) for 1-3 minutes. On success,
-`job_finished` shows `status: "completed"` with the policy-approved aggregate,
+`job_finished` shows `status: "completed"` with `approvedResult` (policy-approved rows only),
 and every `final_status` is `destroyed`. A policy rejection or execution failure
 exits 1 but still cleans up.
 

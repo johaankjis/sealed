@@ -175,7 +175,10 @@ const runtime = new CreateOSRuntime({
   shape: cfg.shape,
   rootfs: cfg.rootfs,
   egress: cfg.egress,
+  // Runs on the snapshot VM and on every fork before any data or code upload.
   verifyIsolation: async (box) => {
+    await support.assertEgressMatches(tracking.created.get(box.id), cfg.egress);
+    record("egress_config_verified", { id: box.id, egress: cfg.egress });
     await verifyEgressBlocked(box);
     record("egress_probe_blocked", { id: box.id });
   },
@@ -254,7 +257,12 @@ try {
   if (paid?.status !== "paid") throw new Error("synthetic payment was not confirmed");
 
   const done = await orchestrator.executeJob(deps, job.id);
-  record("job_finished", { status: done.status, errorCode: done.errorCode, result: done.result });
+  // Only a policy-approved result is ever reported; nothing else from the sandbox is.
+  record("job_finished", {
+    status: done.status,
+    errorCode: done.errorCode,
+    ...(done.status === "completed" && done.result ? { approvedResult: done.result } : {}),
+  });
   if (done.status === "completed") exitCode = 0;
 } catch (err) {
   record("run_failed", { kind: (err as Error)?.name, code: (err as { code?: string })?.code });

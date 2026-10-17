@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertEgressMatches,
   LiveUsageError,
   parseLiveConfig,
   planCleanup,
@@ -79,6 +80,7 @@ function fakeBox(id: string, extra: Partial<SdkSandbox> = {}): SdkSandbox {
     destroy: async () => undefined,
     waitUntilDestroyed: async () => undefined,
     refresh: async () => undefined,
+    getEgress: async () => ({ egress: ["127.0.0.1:9"] }),
     ...extra,
   };
   return box;
@@ -136,6 +138,26 @@ describe("planCleanup", () => {
   });
 });
 
+describe("assertEgressMatches", () => {
+  const box = (egress: string[]) => ({ getEgress: async () => ({ egress }) });
+
+  it("accepts the exact configured allowlist", async () => {
+    await expect(assertEgressMatches(box(["127.0.0.1:9"]), ["127.0.0.1:9"])).resolves.toBeUndefined();
+  });
+
+  it.each([
+    [[], "empty list means allow-all"],
+    [["127.0.0.1:9", "pypi.org:443"], "extra rule"],
+    [["pypi.org:443"], "different rule"],
+  ])("rejects %o (%s)", async (egress) => {
+    await expect(assertEgressMatches(box(egress), ["127.0.0.1:9"])).rejects.toThrow("does not match");
+  });
+
+  it("rejects sandboxes this run did not create", async () => {
+    await expect(assertEgressMatches(undefined, ["127.0.0.1:9"])).rejects.toThrow("not created by this run");
+  });
+});
+
 describe("SyntheticRunPayments", () => {
   it("approves only its own session after binding and cannot create checkouts", async () => {
     const payments = new SyntheticRunPayments("live_synthetic_1a2b3c4d");
@@ -175,5 +197,9 @@ describe("live smoke isolation", () => {
     expect(guard).toBeLessThan(source.indexOf('import("@nodeops-createos/sandbox")'));
     expect(source.indexOf("client.templates.list()")).toBeLessThan(source.indexOf("new CreateOSRuntime("));
     expect(source.indexOf("client.listSandboxes()")).toBeLessThan(source.indexOf("new CreateOSRuntime("));
+    // Allowlist readback precedes the network probe; only approved results are reported.
+    expect(source.indexOf("assertEgressMatches(")).toBeLessThan(source.indexOf("await verifyEgressBlocked(box)"));
+    expect(source).toContain('done.status === "completed" && done.result ? { approvedResult');
+    expect(source).toContain("maxRetries: 0");
   });
 });

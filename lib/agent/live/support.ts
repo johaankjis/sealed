@@ -87,6 +87,7 @@ export interface SdkSandbox {
   destroy(): Promise<unknown>;
   waitUntilDestroyed(options?: { timeoutMs?: number }): Promise<unknown>;
   refresh(): Promise<unknown>;
+  getEgress(): Promise<{ egress: string[] }>;
 }
 
 export interface SdkClient {
@@ -158,6 +159,24 @@ export function planCleanup(input: {
     }
   }
   return [...ours].filter((id) => !input.preexisting.has(id));
+}
+
+/**
+ * Reads the provider-side allowlist back and requires it to equal the
+ * configured, non-empty rules. An empty list means "allow all" in CreateOS,
+ * so this runs before the connection probe and before any upload.
+ */
+export async function assertEgressMatches(
+  box: Pick<SdkSandbox, "getEgress"> | undefined,
+  expected: string[]
+): Promise<void> {
+  if (!box) throw new Error("Sandbox was not created by this run");
+  const { egress } = await box.getEgress();
+  const actual = [...(egress ?? [])].sort();
+  const wanted = [...expected].sort();
+  if (actual.length === 0 || actual.length !== wanted.length || actual.some((rule, i) => rule !== wanted[i])) {
+    throw new Error("Sandbox egress allowlist does not match the restrictive configuration");
+  }
 }
 
 /**
