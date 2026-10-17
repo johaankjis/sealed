@@ -1,20 +1,24 @@
-.projects/cache
-.projects/vault
-.projects/state.test.json
-.projects/state.local.test.json
-.env
-.env.*
-!.env.example
-
-# Dependencies and build output
+# Dependencies
 node_modules/
+
+# Next.js build output
 .next/
+out/
+
+# TypeScript cache
 *.tsbuildinfo
 
-# Environment secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
-# Stripe Projects local state and credentials
+# Stripe Projects local configuration and credentials
 .projects/
+
+# Python generated files
+__pycache__/
+*.pyc
+
+# System files
+.DS_Store
