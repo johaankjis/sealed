@@ -11,6 +11,21 @@ export interface VerifiedWebhookEvent {
   verification?: PaymentVerification;
 }
 
+export interface WebhookSessionDetails {
+  sessionId: string;
+  jobId: string;
+  clientReferenceId: string | null;
+  metadataJobId: string | null;
+  paymentStatus: Stripe.Checkout.Session.PaymentStatus | null;
+  sessionStatus: Stripe.Checkout.Session.Status | null;
+  amountTotal: number | null;
+  currency: string | null;
+}
+
+export interface DetailedVerifiedWebhookEvent extends VerifiedWebhookEvent {
+  session?: WebhookSessionDetails;
+}
+
 export interface VerifyWebhookOptions {
   /**
    * Stripe webhook signing secret (`whsec_...`).
@@ -26,19 +41,11 @@ export interface VerifyWebhookOptions {
 
 const DEFAULT_WEBHOOK_STRIPE = new Stripe("sk_test_webhook_verifier_placeholder");
 
-/**
- * Verifies the `stripe-signature` header against the raw request payload using
- * `stripe.webhooks.constructEvent` and parses Checkout Session lifecycle events
- * into a `VerifiedWebhookEvent`.
- *
- * Security rule: Never accepts unsigned or invalidly signed webhook payloads,
- * and only marks a job as paid when `session.payment_status === "paid"`.
- */
-export function verifyStripeWebhook(
+function constructStripeEvent(
   rawBody: string | Buffer,
   signatureHeader: string | null | undefined,
   options: VerifyWebhookOptions = {}
-): VerifiedWebhookEvent {
+): Stripe.Event {
   const webhookSecret =
     options.webhookSecret ?? process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -68,9 +75,8 @@ export function verifyStripeWebhook(
 
   const stripe = options.stripeClient ?? DEFAULT_WEBHOOK_STRIPE;
 
-  let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(
+    return stripe.webhooks.constructEvent(
       rawBody,
       signatureHeader,
       webhookSecret.trim()
@@ -82,8 +88,37 @@ export function verifyStripeWebhook(
       error
     );
   }
+}
 
+/**
+ * Verifies the `stripe-signature` header against the raw request payload using
+ * `stripe.webhooks.constructEvent` and parses Checkout Session lifecycle events
+ * into a `VerifiedWebhookEvent`.
+ *
+ * Security rule: Never accepts unsigned or invalidly signed webhook payloads,
+ * and only marks a job as paid when `session.payment_status === "paid"`.
+ */
+export function verifyStripeWebhook(
+  rawBody: string | Buffer,
+  signatureHeader: string | null | undefined,
+  options: VerifyWebhookOptions = {}
+): VerifiedWebhookEvent {
+  const event = constructStripeEvent(rawBody, signatureHeader, options);
   return parseStripeCheckoutEvent(event);
+}
+
+/**
+ * Verifies the `stripe-signature` header and returns both the `VerifiedWebhookEvent`
+ * and full `WebhookSessionDetails` (including `amountTotal`, `currency`, `paymentStatus`,
+ * and job association fields) for route-level validation.
+ */
+export function verifyStripeWebhookDetailed(
+  rawBody: string | Buffer,
+  signatureHeader: string | null | undefined,
+  options: VerifyWebhookOptions = {}
+): DetailedVerifiedWebhookEvent {
+  const event = constructStripeEvent(rawBody, signatureHeader, options);
+  return parseStripeCheckoutEventDetailed(event);
 }
 
 /**
@@ -92,11 +127,22 @@ export function verifyStripeWebhook(
 export function parseStripeCheckoutEvent(
   event: Stripe.Event
 ): VerifiedWebhookEvent {
+  const { session: _session, ...verified } = parseStripeCheckoutEventDetailed(event);
+  return verified;
+}
+
+/**
+ * Maps a verified `Stripe.Event` into a `DetailedVerifiedWebhookEvent` including
+ * session amount, currency, status, and job association metadata.
+ */
+export function parseStripeCheckoutEventDetailed(
+  event: Stripe.Event
+): DetailedVerifiedWebhookEvent {
   switch (event.type) {
     case "checkout.session.completed":
     case "checkout.session.async_payment_succeeded": {
       const session = event.data.object as Stripe.Checkout.Session;
-      const jobId = extractJobIdFromSession(session);
+      const details = extractSessionDetails(session);
       const isPaid =
         session.payment_status === "paid" && session.status !== "expired";
 
@@ -105,27 +151,29 @@ export function parseStripeCheckoutEvent(
         eventType: event.type,
         action: isPaid ? "mark_paid" : "ignore",
         verification: {
-          jobId,
+          jobId: details.jobId,
           paid: isPaid,
-          stripeSessionId: session.id,
+          stripeSessionId: details.sessionId,
         },
+        session: details,
       };
     }
 
     case "checkout.session.expired":
     case "checkout.session.async_payment_failed": {
       const session = event.data.object as Stripe.Checkout.Session;
-      const jobId = extractJobIdFromSession(session);
+      const details = extractSessionDetails(session);
 
       return {
         eventId: event.id,
         eventType: event.type,
         action: "mark_failed",
         verification: {
-          jobId,
+          jobId: details.jobId,
           paid: false,
-          stripeSessionId: session.id,
+          stripeSessionId: details.sessionId,
         },
+        session: details,
       };
     }
 
@@ -138,9 +186,31 @@ export function parseStripeCheckoutEvent(
   }
 }
 
-function extractJobIdFromSession(session: Stripe.Checkout.Session): string {
-  const jobId =
-    session.metadata?.jobId?.trim() || session.client_reference_id?.trim();
+function extractSessionDetails(
+  session: Stripe.Checkout.Session
+): WebhookSessionDetails {
+  if (!session || typeof session.id !== "string" || !session.id.trim()) {
+    throw new PaymentError(
+      "MISSING_JOB_METADATA",
+      "Stripe Checkout session is missing a valid session id."
+    );
+  }
+
+  const metadataJobId = session.metadata?.jobId?.trim() || null;
+  const clientReferenceId = session.client_reference_id?.trim() || null;
+
+  if (
+    metadataJobId &&
+    clientReferenceId &&
+    metadataJobId !== clientReferenceId
+  ) {
+    throw new PaymentError(
+      "PAYMENT_NOT_VERIFIED",
+      `Stripe Checkout session ${session.id} has mismatched metadata.jobId ("${metadataJobId}") and client_reference_id ("${clientReferenceId}").`
+    );
+  }
+
+  const jobId = metadataJobId || clientReferenceId;
 
   if (!jobId) {
     throw new PaymentError(
@@ -149,5 +219,18 @@ function extractJobIdFromSession(session: Stripe.Checkout.Session): string {
     );
   }
 
-  return jobId;
+  return {
+    sessionId: session.id.trim(),
+    jobId,
+    clientReferenceId,
+    metadataJobId,
+    paymentStatus: session.payment_status ?? null,
+    sessionStatus: session.status ?? null,
+    amountTotal:
+      typeof session.amount_total === "number" ? session.amount_total : null,
+    currency:
+      typeof session.currency === "string"
+        ? session.currency.trim().toLowerCase()
+        : null,
+  };
 }

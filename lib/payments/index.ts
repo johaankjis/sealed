@@ -32,17 +32,30 @@ export {
 } from "./idempotency";
 
 export {
+  getPaymentRouteDeps,
+  handleCheckoutPost,
+  handleStripeWebhookPost,
+  type PaymentRouteDeps,
+  setPaymentRouteDeps,
+} from "./routes";
+
+export {
+  type DetailedPaymentVerification,
   MIN_USD_AMOUNT_CENTS,
   StripePaymentProvider,
   type StripePaymentProviderOptions,
 } from "./stripe-provider";
 
 export {
+  type DetailedVerifiedWebhookEvent,
   parseStripeCheckoutEvent,
+  parseStripeCheckoutEventDetailed,
   type VerifiedWebhookEvent,
   type VerifyWebhookOptions,
   verifyStripeWebhook,
+  verifyStripeWebhookDetailed,
   type WebhookPaymentAction,
+  type WebhookSessionDetails,
 } from "./webhook";
 
 /**
