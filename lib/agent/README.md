@@ -14,6 +14,8 @@ into the Next.js API routes.
 - `codegen.ts`: `ClaudeCodeGenerator` (forced `submit_analysis` tool). Its runtime contract matches `sandbox/runner.py`: `con`, table `dataset`, assign `result`.
 - `catalog.ts` and `demo/coffee.ts` / `fixtures/downtown-coffee-sales.csv`: the synthetic coffee-chain dataset (20,010 rows, seed 42). Regenerate it with `node lib/agent/demo/coffee.ts`.
 - `http.ts`: maps errors to buyer-safe HTTP responses.
+- `egress.ts`: the in-sandbox egress probe (`verifyEgressBlocked`), shared by `server.ts` and the live test.
+- `live/`: a manual, billable live smoke test (`coffee-live.ts --run`). Nothing in the app may import it. See `live/README.md`.
 
 ## API routes (app/api, added in Sprint 2)
 | Route | Behaviour |

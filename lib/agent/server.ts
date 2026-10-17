@@ -3,14 +3,17 @@ import type { QueryJob } from "../../contracts/job";
 import type { PaymentProvider, PaymentVerification } from "../../contracts/payments";
 import type { SandboxRuntime } from "../../contracts/sandbox";
 import { createPaymentProvider } from "../payments";
-import { CreateOSRuntime, type CreateOSSandbox } from "../sandbox/createos";
+import { CreateOSRuntime } from "../sandbox/createos";
 import { AggregateOnlyOutputPolicy, DEFAULT_OUTPUT_POLICY_OPTIONS } from "../security";
 import { DEMO_CATALOG } from "./catalog";
+import { PROBE_HOST, verifyEgressBlocked } from "./egress";
 import { ClaudeCodeGenerator, type CodeGenerator } from "./codegen";
 import { StaticDatasetCatalog, type DatasetCatalog } from "./datasets";
 import { SnapshotAuthorizer } from "./executionAuth";
 import { InMemoryJobStore, type JobStore } from "./jobStore";
 import { confirmPayment, executeJob, failPayment, type AgentDeps } from "./orchestrator";
+
+export { verifyEgressBlocked } from "./egress";
 
 // Server-only composition root. Every API route and the Stripe webhook go
 // through getAgentRuntime() so the app has exactly one JobStore.
@@ -34,31 +37,6 @@ function requireEnv(name: string): string {
 function lazy<T>(build: () => T): () => T {
   let value: T | undefined;
   return () => (value ??= build());
-}
-
-const PROBE_HOST = process.env.SEALED_EGRESS_PROBE_HOST ?? "1.1.1.1";
-const PROBE_SCRIPT = [
-  "import socket",
-  "try:",
-  `    socket.create_connection((${JSON.stringify(PROBE_HOST)}, 443), timeout=5).close()`,
-  "    print('OPEN')",
-  "except OSError:",
-  "    print('BLOCKED')",
-].join("\n");
-
-/**
- * Empirical egress check run inside each sandbox before data or code is
- * uploaded: a connection to a host outside the allowlist must fail. This is
- * evidence for one destination, not a proof of zero egress.
- */
-export async function verifyEgressBlocked(sandbox: CreateOSSandbox): Promise<void> {
-  const { result } = await sandbox.runCommand("python3", ["-I", "-c", PROBE_SCRIPT], {
-    timeoutMs: 20_000,
-    retry: false,
-  });
-  if (result.exit_code !== 0 || result.stdout.trim() !== "BLOCKED") {
-    throw new Error("Sandbox egress probe was not blocked");
-  }
 }
 
 /** Table names come from the trusted catalog so the runner and the generated SQL agree. */
