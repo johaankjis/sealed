@@ -1,0 +1,262 @@
+[
+  {
+    "event": "tracked",
+    "detail": {
+      "id": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "status": "running"
+    }
+  },
+  {
+    "event": "remote_versions",
+    "detail": "3.13.14 1.5.4"
+  },
+  {
+    "event": "printed_json_runner_passed",
+    "detail": {
+      "columns": [
+        "region",
+        "n",
+        "avg"
+      ],
+      "rows": [
+        {
+          "region": "EU",
+          "n": 10,
+          "avg": 12.5
+        },
+        {
+          "region": "US",
+          "n": 10,
+          "avg": 20
+        }
+      ],
+      "groupSizes": [
+        10,
+        10
+      ]
+    }
+  },
+  {
+    "event": "assignment_runner_passed",
+    "detail": {}
+  },
+  {
+    "event": "parquet_runner_passed",
+    "detail": {}
+  },
+  {
+    "event": "invalid_output_runner_passed",
+    "detail": {
+      "cases": 4
+    }
+  },
+  {
+    "event": "guest_timeout_observed",
+    "detail": {
+      "exit": 137,
+      "elapsedMs": 2038
+    }
+  },
+  {
+    "event": "guest_timeout_passed",
+    "detail": {
+      "exit": 137,
+      "elapsedMs": 2038
+    }
+  },
+  {
+    "event": "pause",
+    "detail": {
+      "id": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "status": "pausing"
+    }
+  },
+  {
+    "event": "paused",
+    "detail": {
+      "id": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "status": "paused"
+    }
+  },
+  {
+    "event": "fork",
+    "detail": {
+      "parent": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "child": "sb-01m560j0g0cb0zjw2dvb4vaq10"
+    }
+  },
+  {
+    "event": "tracked",
+    "detail": {
+      "id": "sb-01m560j0g0cb0zjw2dvb4vaq10",
+      "status": "forking"
+    }
+  },
+  {
+    "event": "running",
+    "detail": {
+      "id": "sb-01m560j0g0cb0zjw2dvb4vaq10",
+      "status": "running"
+    }
+  },
+  {
+    "event": "command",
+    "detail": {
+      "id": "sb-01m560j0g0cb0zjw2dvb4vaq10",
+      "exit": 0,
+      "elapsedMs": 279
+    }
+  },
+  {
+    "event": "destroyed",
+    "detail": {
+      "id": "sb-01m560j0g0cb0zjw2dvb4vaq10",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "agent_python_passed",
+    "detail": {
+      "columns": [
+        "region",
+        "n",
+        "avg"
+      ],
+      "rows": [
+        {
+          "region": "EU",
+          "n": 10,
+          "avg": 12.5
+        },
+        {
+          "region": "US",
+          "n": 10,
+          "avg": 20
+        }
+      ],
+      "groupSizes": [
+        10,
+        10
+      ]
+    }
+  },
+  {
+    "event": "fork",
+    "detail": {
+      "parent": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "child": "sb-01m560jpfer9y4a0sg2cbr4zr9"
+    }
+  },
+  {
+    "event": "tracked",
+    "detail": {
+      "id": "sb-01m560jpfer9y4a0sg2cbr4zr9",
+      "status": "forking"
+    }
+  },
+  {
+    "event": "running",
+    "detail": {
+      "id": "sb-01m560jpfer9y4a0sg2cbr4zr9",
+      "status": "running"
+    }
+  },
+  {
+    "event": "command",
+    "detail": {
+      "id": "sb-01m560jpfer9y4a0sg2cbr4zr9",
+      "exit": 137,
+      "elapsedMs": 2046
+    }
+  },
+  {
+    "event": "destroyed",
+    "detail": {
+      "id": "sb-01m560jpfer9y4a0sg2cbr4zr9",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "timeout_passed",
+    "detail": {
+      "budgetMs": 2000
+    }
+  },
+  {
+    "event": "fork",
+    "detail": {
+      "parent": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "child": "sb-01m560k4c6e4d13xbh8sa20ck8"
+    }
+  },
+  {
+    "event": "tracked",
+    "detail": {
+      "id": "sb-01m560k4c6e4d13xbh8sa20ck8",
+      "status": "forking"
+    }
+  },
+  {
+    "event": "running",
+    "detail": {
+      "id": "sb-01m560k4c6e4d13xbh8sa20ck8",
+      "status": "running"
+    }
+  },
+  {
+    "event": "command",
+    "detail": {
+      "id": "sb-01m560k4c6e4d13xbh8sa20ck8",
+      "exit": 137,
+      "elapsedMs": 2051
+    }
+  },
+  {
+    "event": "destroyed",
+    "detail": {
+      "id": "sb-01m560k4c6e4d13xbh8sa20ck8",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "destroyed",
+    "detail": {
+      "id": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "concurrent_cleanup_passed",
+    "detail": {
+      "snapshot": "sb-01m560hgt1z6ahryrxw9fj81ha"
+    }
+  },
+  {
+    "event": "final_status",
+    "detail": {
+      "id": "sb-01m560hgt1z6ahryrxw9fj81ha",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "final_status",
+    "detail": {
+      "id": "sb-01m560j0g0cb0zjw2dvb4vaq10",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "final_status",
+    "detail": {
+      "id": "sb-01m560jpfer9y4a0sg2cbr4zr9",
+      "status": "destroyed"
+    }
+  },
+  {
+    "event": "final_status",
+    "detail": {
+      "id": "sb-01m560k4c6e4d13xbh8sa20ck8",
+      "status": "destroyed"
+    }
+  }
+]
