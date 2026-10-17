@@ -13,6 +13,11 @@ import { PaymentError } from "./errors";
 
 export const MIN_USD_AMOUNT_CENTS = 50;
 
+export interface DetailedPaymentVerification extends PaymentVerification {
+  amountTotal: number | null;
+  currency: string | null;
+}
+
 export interface StripePaymentProviderOptions {
   /**
    * Stripe secret API key (`sk_test_...` or `sk_live_...`).
@@ -164,6 +169,17 @@ export class StripePaymentProvider implements PaymentProvider {
   }
 
   async verifyPayment(sessionId: string): Promise<PaymentVerification> {
+    const detailed = await this.verifyCheckoutSessionDetails(sessionId);
+    return {
+      jobId: detailed.jobId,
+      paid: detailed.paid,
+      stripeSessionId: detailed.stripeSessionId,
+    };
+  }
+
+  async verifyCheckoutSessionDetails(
+    sessionId: string
+  ): Promise<DetailedPaymentVerification> {
     const trimmedSessionId = sessionId?.trim();
     if (!trimmedSessionId) {
       throw new PaymentError(
@@ -183,8 +199,17 @@ export class StripePaymentProvider implements PaymentProvider {
       );
     }
 
-    const jobId =
-      session.metadata?.jobId?.trim() || session.client_reference_id?.trim();
+    const metadataJobId = session.metadata?.jobId?.trim();
+    const clientRefJobId = session.client_reference_id?.trim();
+
+    if (metadataJobId && clientRefJobId && metadataJobId !== clientRefJobId) {
+      throw new PaymentError(
+        "PAYMENT_NOT_VERIFIED",
+        `Stripe Checkout session ${session.id} has mismatched metadata.jobId ("${metadataJobId}") and client_reference_id ("${clientRefJobId}").`
+      );
+    }
+
+    const jobId = metadataJobId || clientRefJobId;
 
     if (!jobId) {
       throw new PaymentError(
@@ -193,13 +218,25 @@ export class StripePaymentProvider implements PaymentProvider {
       );
     }
 
+    const currency =
+      typeof session.currency === "string"
+        ? session.currency.trim().toLowerCase()
+        : null;
+    const amountTotal =
+      typeof session.amount_total === "number" ? session.amount_total : null;
+
+    const currencyValid = currency === null || currency === "usd";
     const paid =
-      session.payment_status === "paid" && session.status !== "expired";
+      session.payment_status === "paid" &&
+      session.status !== "expired" &&
+      currencyValid;
 
     return {
       jobId,
       paid,
       stripeSessionId: session.id,
+      amountTotal,
+      currency,
     };
   }
 }
