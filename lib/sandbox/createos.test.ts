@@ -14,6 +14,7 @@ function box(id: string) {
     pause: vi.fn().mockResolvedValue(undefined),
     waitUntilPaused: vi.fn().mockResolvedValue(undefined),
     fork: vi.fn<(...args: unknown[]) => Promise<CreateOSSandbox>>(),
+    waitUntilRunning: vi.fn().mockResolvedValue(undefined),
     destroy: vi.fn().mockResolvedValue(undefined),
     waitUntilDestroyed: vi.fn().mockResolvedValue(undefined),
   };
@@ -46,7 +47,8 @@ describe("CreateOS lifecycle", () => {
     expect(await runtime.execute(id, "result = {} ")).toEqual(candidate);
     expect(config.authorizeExecution).toHaveBeenCalledWith(id);
     expect(config.verifyIsolation).toHaveBeenCalledTimes(2);
-    expect(child.runCommand).toHaveBeenCalledWith("timeout", ["--signal=KILL", "30s",
+    expect(child.waitUntilRunning).toHaveBeenCalledOnce();
+    expect(child.runCommand).toHaveBeenCalledWith("timeout", ["--foreground", "--signal=KILL", "30s",
       "python3", "-I", "/tmp/sealed-runner.py"], { timeoutMs: 35000, retry: false });
     expect(child.destroy).toHaveBeenCalledOnce();
     expect(child.waitUntilDestroyed).toHaveBeenCalledOnce();
@@ -71,7 +73,7 @@ describe("CreateOS lifecycle", () => {
     expect(parent.destroy).toHaveBeenCalledOnce();
   });
 
-  it.each(["command", "output", "upload", "isolation"])("cleans failed %s without leaking diagnostics", async failure => {
+  it.each(["command", "output", "upload", "isolation", "startup"])("cleans failed %s without leaking diagnostics", async failure => {
     const { runtime, child, config, prepare } = setup();
     const id = await prepare();
     if (failure === "command") child.runCommand.mockRejectedValue(new Error("SECRET"));
@@ -79,6 +81,7 @@ describe("CreateOS lifecycle", () => {
       stdout: "SECRET", stderr: "SECRET", exit_code: 0 } });
     if (failure === "upload") child.files.upload.mockRejectedValue(new Error("SECRET"));
     if (failure === "isolation") config.verifyIsolation.mockRejectedValue(new Error("SECRET"));
+    if (failure === "startup") child.waitUntilRunning.mockRejectedValue(new Error("SECRET"));
     await expect(runtime.execute(id, "pass")).rejects.toThrow(/^SANDBOX_EXECUTION_FAILED$|^INVALID_SANDBOX_RESULT$/);
     expect(child.destroy).toHaveBeenCalledOnce();
     await runtime.dispose();
@@ -104,16 +107,53 @@ describe("CreateOS lifecycle", () => {
     expect(parent.destroy).toHaveBeenCalledTimes(2);
   });
 
-  it("blocks overlapping execution and destruction", async () => {
-    const { runtime, config, prepare } = setup();
+  it("deletes the dataset even when a child is stuck, and retains the child for retry", async () => {
+    const { runtime, parent, child, prepare } = setup();
+    const id = await prepare();
+    child.waitUntilDestroyed.mockRejectedValue(new Error("provider stuck destroying"));
+    await expect(runtime.execute(id, "pass")).rejects.toThrow("SANDBOX_CLEANUP_FAILED");
+    await expect(runtime.destroy(id)).rejects.toThrow("SANDBOX_CLEANUP_FAILED");
+    expect(parent.waitUntilDestroyed).toHaveBeenCalledOnce();
+    child.waitUntilDestroyed.mockResolvedValue(undefined);
+    await runtime.dispose();
+    expect(child.waitUntilDestroyed).toHaveBeenCalledTimes(3);
+  });
+
+  it("blocks overlapping execution and waits for cleanup after an outer timeout", async () => {
+    const { runtime, config, parent, child, prepare } = setup();
     const id = await prepare();
     let release!: (paid: boolean) => void;
     config.authorizeExecution.mockImplementation(() => new Promise(resolve => { release = resolve; }));
     const running = runtime.execute(id, "pass");
     await expect(runtime.execute(id, "pass")).rejects.toThrow("SNAPSHOT_UNAVAILABLE");
-    await expect(runtime.destroy(id)).rejects.toThrow("SNAPSHOT_BUSY");
+    const cleanup = runtime.destroy(id);
+    const duplicateCleanup = runtime.destroy(id);
+    expect(parent.destroy).not.toHaveBeenCalled();
+    await expect(runtime.execute(id, "pass")).rejects.toThrow("SNAPSHOT_UNAVAILABLE");
     release(true);
     await running;
+    await Promise.all([cleanup, duplicateCleanup]);
+    expect(child.destroy).toHaveBeenCalledOnce();
+    expect(parent.destroy).toHaveBeenCalledOnce();
+    await expect(runtime.execute(id, "pass")).rejects.toThrow("SNAPSHOT_UNAVAILABLE");
+  });
+
+  it.each([124, 137])("sanitizes timeout exit %i and destroys the child", async exit_code => {
+    const { runtime, child, prepare } = setup();
+    const id = await prepare();
+    child.runCommand.mockResolvedValue({ result: { stdout: "SECRET", stderr: "SECRET", exit_code } });
+    await expect(runtime.execute(id, "while True: pass")).rejects.toThrow("SANDBOX_TIMEOUT");
+    expect(child.waitUntilDestroyed).toHaveBeenCalledOnce();
+    await runtime.destroy(id);
+  });
+
+  it("uses trusted table metadata and supports parquet snapshots", async () => {
+    const { config, parent } = setup();
+    const runtime = new CreateOSRuntime({ ...config, resolveTableName: () => "orders" });
+    await writeFile(join(dir, "data.parquet"), "mock parquet bytes");
+    await runtime.prepareDataset("retail", join(dir, "data.parquet"));
+    expect(parent.files.upload).toHaveBeenCalledWith("/tmp/sealed-dataset.json",
+      JSON.stringify({ tableName: "orders", format: "parquet" }));
     await runtime.dispose();
   });
 });

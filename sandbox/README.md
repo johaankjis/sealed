@@ -1,113 +1,156 @@
 # Sandbox MVP integration
 
 `lib/sandbox/createos.ts` implements the unchanged `SandboxRuntime` contract.
-It prepares a CSV in a paused CreateOS VM, forks an isolated child per execution,
-and destroys/waits for that child before returning a candidate result. Call
-`destroy(snapshotId)` in the job's finalizer to remove the dataset snapshot too.
-Failed child cleanup blocks subsequent execution; retry `destroy`. `dispose()`
-cleans known snapshots, including failed preparations, on worker shutdown.
+It uploads a CSV or Parquet file to a paused CreateOS VM, forks a child for each
+execution attempt, waits for `running`, and destroys/waits for that child before
+returning a candidate result. Call `destroy(snapshotId)` in the job finalizer to
+remove the dataset snapshot too.
 
 ## Server wiring
 
 The integration owner must add `@nodeops-createos/sandbox@0.8.2` to the root
-dependencies. Its published declarations were downloaded to temporary storage
-and checked for structural compatibility with `CreateOSClient` using TypeScript.
-No shared package files or contracts were modified.
+package dependencies. This version was tested live, using its published package
+in temporary storage. No shared package files or contracts were modified.
 
-Instantiate the documented SDK `createClient({ apiKey, retry: false })` on the
-server and inject it into `new CreateOSRuntime(config)`. Keep credentials solely
-in that client. Configuration requires:
+Create the SDK client on the server with `createClient({ apiKey, retry: false })`
+and inject it into `new CreateOSRuntime(config)`. Credentials stay in that client,
+never in the VM. Configuration requires:
 
 - `shape` and a trusted `rootfs` with Python 3, GNU `timeout`, and DuckDB installed.
-  Install DuckDB **inside CreateOS**, before private dataset upload and before
-  restricting egress. Never install or run it on the application host for queries.
+  Install DuckDB **inside CreateOS**, before private data upload and before
+  restricting egress. The live test bootstraps its own temporary VM remotely;
+  installing DuckDB in a VM does not change the `devbox:1` base image.
 - A nonempty `egress` allowlist and `verifyIsolation(sandbox)` which throws unless
-  deployment-specific network checks pass. Do not implement this as a no-op for
-  private data. Empty CreateOS allowlists mean unrestricted outbound access.
-- `authorizeExecution(snapshotId)`: look up the snapshot-to-job mapping, verify
-  authoritative payment state, and atomically claim the paid job. Return false
-  for unpaid or already-claimed jobs. This callback runs before forking or code
-  upload. Never accept a buyer-provided boolean as payment proof.
-- Optional `{ timeoutMs: 30000, maxRetries: 0 }`. Nonzero retry counts are rejected:
-  ambiguous timeouts must not replay a paid execution. SDK retries should also
-  be disabled at client construction.
+  deployment-specific network checks pass. Empty CreateOS allowlists permit all
+  egress. The live test only checks configuration readback with synthetic data;
+  it does not establish a zero-egress guarantee.
+- `resolveTableName(datasetId)` from the trusted catalog, matching the agent's
+  `DatasetDescriptor.tableName`. It defaults to `dataset`. For the agent's retail
+  fixture it must return `orders`. The runner quotes this identifier and reads
+  CSV/Parquet via fixed paths; buyer input must never select local file paths.
+- `authorizeExecution(snapshotId)` must verify that the attempt belongs to the
+  already claimed, paid job. The orchestrator itself claims `paid -> running`:
+  **do not claim that transition again here**, or reject its authorized retries.
+  Use a job-scoped runtime/closure or trusted snapshot-to-job association, and
+  consult authoritative payment state. Never trust a buyer-provided paid flag.
+- Optional runtime `{ timeoutMs: 30000, maxRetries: 0 }`. Runtime/provider retries
+  are disabled to prevent replay on ambiguous failures. The agent's separate
+  `maxRetries: 2` option controls new analysis attempts and must not be passed
+  directly as runtime options. Each accepted attempt gets a fresh fork.
 
-Use a trusted registry to resolve the CSV path; never pass a buyer-supplied path.
-Bundle `sandbox/runner.py` with the worker at its repository-relative location.
-Use a long-lived worker instance: snapshot handles are currently in memory.
-Persist provider IDs/job associations and add crash reconciliation before using
-multiple workers or serverless invocations.
+Use a long-lived worker instance; snapshot handles and pending cleanup are in
+memory. Bundle `sandbox/runner.py` at its repository-relative location. Durable
+job/snapshot associations and crash reconciliation are required for serverless
+or multiple workers. A provider timeout during create/fork may allocate a VM
+without returning its ID; account-level reconciliation must cover this case.
 
-After `execute`, pass the returned `ExecutionResult` to the shared `OutputPolicy`.
-Publish only its approved `ApprovedResult`. This runtime checks JSON shape and
-size, not privacy. Never forward errors from SDK calls, VM stdout/stderr, files,
-or candidate result rows to buyers. The runtime emits fixed error codes only.
-The original contracts do not carry a job/payment binding, so the server wiring
-must supply it via the authorization closure. No contract change is required for
-this MVP; a durable job-bound execution interface is a future integration topic.
+After `execute`, pass the candidate `ExecutionResult` to `OutputPolicy.validate`.
+Publish only the approved result. Shape/size parsing is not privacy approval.
+Never forward VM stdout/stderr, files, SDK errors, or candidate rows to buyers.
+The runtime emits fixed error codes and withholds results if cleanup fails.
 
-## Generated Python interface
+## Agent Python compatibility
 
-The guest runner provides `con`, an in-memory DuckDB connection, with the CSV
-loaded into a table named `dataset`. Analysis must assign `result` to a dict with
-`columns`, `rows`, and optional `groupSizes`, matching `contracts/results.ts`.
-`smoke_analysis.py` illustrates the interface. Incidental prints and tracebacks
-are suppressed. External DuckDB access is disabled after ingestion.
+Read against `lib/agent/README.md`, `codegen.ts`, and the agent's exact `safeCode`
+fixture. The runner supplies the preloaded DuckDB connection `con` and accepts
+one printed JSON line containing `columns`, `rows`, and optional `groupSizes`.
+It retains compatibility with the original `result = {...}` interface when
+nothing is printed. Mixed/debug output, invalid JSON, exceptions, and output
+above 1 MB fail without relaying tracebacks. External DuckDB access is disabled
+after ingestion. CSV and Parquet are supported.
 
-Python execution is not restricted by this wrapper: generated code can bypass
-Python-level conveniences, forge group sizes, access guest files, or write to
-file descriptors. Provider isolation and an independent output policy remain
-essential. The 1 MB parser limit applies after SDK buffering; malicious output
-can still consume transport memory. No zero-egress or aggregate-privacy claim
-has been demonstrated by this implementation.
+Python execution is not restricted by this wrapper. Generated code can bypass
+Python conveniences, forge group sizes, access guest files, and write directly
+to file descriptors. Provider isolation and independent output checks remain
+necessary. The host parser's 1 MB limit applies after SDK buffering; direct
+malicious output can still consume transport memory. The result contract does
+not attest group-size provenance; model-reported counts are not privacy proof.
 
-## Verification performed (2026-10-17)
+## Timeouts and cleanup
 
-- 20 Vitest lifecycle/parser tests passed, including unpaid rejection, cleanup
-  failure recovery, concurrent execution rejection, and malformed results.
-- TypeScript passed, including an isolated check against SDK 0.8.2 declarations.
-- Next.js webpack production build passed using its WASM fallback. Existing local
-  dependencies lack `.bin` links and have a broken native SWC binary; use the
-  direct commands below until dependency installation is repaired by its owner.
-- Authenticated with the existing CreateOS CLI account and used the already
-  running `sealed-test` VM; no new resources were provisioned.
-- Remote Python: 3.13.14. Remote DuckDB was absent; installed DuckDB 1.5.4 there.
-- Uploaded the runner and synthetic fixtures, then ran the command below inside
-  CreateOS. It exited 0 and returned east=30, west=70, groupSizes=[2,2]. A separate
-  remote DuckDB `SELECT 6 * 7` returned 42.
-- The existing VM's firewall returned `rules: []`. No network enforcement test
-  was performed. The smoke test used synthetic data, never customer data.
+The guest command is `timeout --foreground --signal=KILL <seconds>s python3 -I
+/tmp/sealed-runner.py`. Foreground mode keeps the timeout supervisor alive to
+report exit 137 when Python is killed. The VM is then destroyed, including any
+remaining descendant processes. A transport timeout also enters child cleanup.
+Exit 124/137 maps to `SANDBOX_TIMEOUT`; other errors use fixed failure codes.
+The request timeout allows five additional seconds over the guest budget.
+
+An orchestrator deadline only abandons its promise. `destroy()` now waits for
+an active execution's bounded command and child cleanup, then removes the
+snapshot, instead of failing with `SNAPSHOT_BUSY`. New attempts are rejected
+while execution/destruction is in progress. Configure the outer deadline to
+allow VM readiness and cleanup as well as the guest computation budget.
+
+Cleanup failures remain retryable. Parent deletion is attempted even if a child
+is stuck; `dispose()` visits all known snapshots and pending children without
+stopping at the first failure. Provider destruction is asynchronous, so a
+`destroying` response is not treated as confirmed deletion.
+
+## Live verification, 2026-10-17
+
+SDK 0.8.2, remote Python 3.13.14, remote DuckDB 1.5.4, synthetic data only.
+See `live-smoke-report.json` for the successful run and provider IDs.
+
+| Check | Result |
+| --- | --- |
+| Agent's exact printed-JSON Python fixture | Passed through the runner and runtime; EU average 12.5, US average 20, 10 records per group |
+| Legacy assignment output | Passed |
+| CSV and Parquet / catalog table `orders` | Passed |
+| Invalid JSON, extra output, exception, oversized output | All rejected with empty stdout/stderr |
+| Snapshot pause and wait | Reached `paused` |
+| Fork / explicit wait for readiness | Three children reached `running` |
+| Successful runtime execution | Exit 0; child confirmed `destroyed` before result returned |
+| Infinite-loop timeout | Guest exited 137 after 2038 ms directly and 2046 ms through runtime (2000 ms budget) |
+| Concurrent destroy during execution | Third child timed out after 2051 ms, then child and snapshot reached `destroyed` |
+| Final cleanup | All four resources in the successful run confirmed `destroyed` |
+| Local verification | 25 sandbox + 26 agent tests passed; TypeScript and production webpack build passed |
+
+An earlier test fork (`sb-01m560a6e4ye86tqj2qdkhnmg4`) was used before adding the
+explicit readiness wait. Its cleanup exceeded the wait budget in `destroying`.
+A subsequent CLI deletion retry confirmed `destroyed` at 22:45:01 UTC. Its parent
+and the intermediate runner-test VM were also deleted. Final account listing
+contained only the preexisting `sealed-test` VM; no test-created resources remain.
+
+This verifies the agent's Python protocol and saved fixture, not a new live
+Claude API generation. No Anthropic credential was available to the test.
+No generated analysis or DuckDB query was executed on the application host.
+
+## Reproduce
+
+The live test creates billable resources: run only in an explicitly authorized
+account. It installs DuckDB in a dedicated VM, uses synthetic data, and cleans
+up all IDs it obtains. Its synthetic authorization callback is not production
+payment wiring. Refresh an existing CLI login with `createos whoami` first if
+using `--cli-auth`; the SDK itself does not refresh the CLI OAuth token.
 
 ```sh
-node node_modules/vitest/vitest.mjs run lib/sandbox/createos.test.ts
+node node_modules/vitest/vitest.mjs run lib/sandbox/createos.test.ts lib/agent/__tests__
 node node_modules/typescript/bin/tsc --noEmit --incremental false
 node node_modules/next/dist/bin/next build --webpack
 
-# Existing authorized CreateOS test VM only; commands execute remotely.
-createos sandbox exec sealed-test -- python3 -m pip install duckdb==1.5.4
-createos sandbox push sealed-test sandbox/runner.py /tmp/sealed-runner.py
-createos sandbox push sealed-test sandbox/smoke.csv /tmp/sealed-dataset.csv
-createos sandbox push sealed-test sandbox/smoke_analysis.py /tmp/sealed-analysis.py
-createos sandbox exec sealed-test -- timeout --signal=KILL 30s python3 -I /tmp/sealed-runner.py
+# Node 24; root SDK dependency installed, with server API key in environment:
+node --experimental-transform-types sandbox/live-smoke.ts --run
+
+# Alternatively, authorized existing CLI login and SDK downloaded outside repo:
+SEALED_CREATEOS_SDK_MODULE=/tmp/sealed-createos-sdk/package/dist/index.js \
+SEALED_SMOKE_REPORT=/tmp/sealed-live-report.json \
+node --experimental-transform-types sandbox/live-smoke.ts --run --cli-auth
 ```
 
-## SDK evidence and remaining blockers
+Existing dependencies have a damaged native SWC binary; the production build
+passes with Next.js's WASM fallback. The direct commands avoid missing `.bin`
+links. No shared dependency repair was attempted.
 
-Verified method names and signatures against published SDK 0.8.2 and official
-[Sandbox reference](https://createos.sh/docs/Sandbox/SDK/Reference/Sandbox/) and
-[Client reference](https://createos.sh/docs/Sandbox/SDK/Reference/Client/).
-No missing SDK method was invented. `files.upload` accepts `BodyInit`; the
-adapter copies file bytes to an `ArrayBuffer` for compatibility. `runCommand`
-accepts request timeout/retry options; the guest `timeout` also bounds execution.
+## SDK findings and remaining integration work
 
-Live pause/fork/destroy lifecycle remains mock-tested only. No extra VM was
-provisioned, and the preexisting test VM was not destroyed. A timeout during
-provider creation/fork can leave a VM without a returned handle; account-level
-reconciliation is required. This adapter cannot recover such IDs itself.
+All methods are documented in the official [Sandbox reference](https://createos.sh/docs/Sandbox/SDK/Reference/Sandbox/)
+and [Client reference](https://createos.sh/docs/Sandbox/SDK/Reference/Client/).
+Snapshot/fork **works**. The critical incompatibility was treating the returned
+fork handle as immediately ready: it is initially `forking` and requires
+`waitUntilRunning()` before uploads or commands. OAuth uses `X-Access-Token`
+via SDK `authHeaders`, not a Bearer header. Test VM names must be <=22 characters.
+No SDK functionality remains blocked in the successful synthetic lifecycle.
 
-Private-data release is blocked on verified network enforcement, trusted image
-provisioning (the DuckDB installation changed the test VM, not `devbox:1`),
-payment/job binding, and output-policy integration. The shared result contract
-does not attest group-size provenance; do not trust model-reported counts as
-privacy evidence. Install the SDK dependency and complete server wiring through
-the owning agents. No shared-contract edits were made.
+Production wiring still needs the SDK dependency, trusted DuckDB image,
+job/payment binding, output-policy integration, and verified network controls.
+No orchestration, security, or shared-contract files were modified.
