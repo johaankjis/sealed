@@ -8,7 +8,7 @@ into the Next.js API routes.
 - `orchestrator.ts`: `createJob`, `startCheckout`, `confirmPayment`, `failPayment`, `executeJob`.
 - `server.ts`: the composition root. `getAgentRuntime()` holds the **single** `JobStore` and builds the Stripe provider, CreateOS runtime, Claude generator and `AggregateOnlyOutputPolicy` lazily. It also exports the webhook hooks `handleVerifiedPayment` and `handleFailedPayment`, plus `reconcilePayment` and `toBuyerJob`.
 - `jobStore.ts`: `JobStore` with atomic `transition(id, from, to)`, and `InMemoryJobStore`.
-- `executionAuth.ts`: `SnapshotAuthorizer` provides `authorizeExecution` for `CreateOSRuntime`, which maps a snapshot to its job.
+- `executionAuth.ts`: `SnapshotAuthorizer` provides `authorizeExecution` for `CreateOSRuntime`, which maps a snapshot to its job. `server.ts` also passes `resolveTableName` from the catalog, so the runner's table and the generated SQL agree.
 - `groupSizes.ts`: a fail-closed group-size evidence check that runs before the output policy.
 - `codeCheck.ts`: pre-flight check on generated Python. It includes GLM's `validateGeneratedCode` and requires `result = {..., groupSizes}`.
 - `codegen.ts`: `ClaudeCodeGenerator` (forced `submit_analysis` tool). Its runtime contract matches `sandbox/runner.py`: `con`, table `dataset`, assign `result`.
@@ -20,7 +20,7 @@ into the Next.js API routes.
 | --- | --- |
 | `POST /api/jobs` `{datasetId, question}` | Runs `validateQuestion` and checks the catalog. Returns `201` with a `QueryJob` (`created`). Never executes. |
 | `GET /api/jobs/:id` | Returns the buyer view (no `stripeSessionId`). If the job is `payment_pending`, asks Stripe about the **server-stored** session (throttled to once per 5s per job) and starts execution when it is paid. |
-| `POST /api/checkout` `{jobId}` | Prices the job from the catalog and creates (or idempotently re-fetches) the Stripe Checkout session. `created -> payment_pending`. |
+| `POST /api/checkout` `{jobId}` | Served by lib/payments (`handleCheckoutPost`), which calls `startCheckout`. Prices the job from the catalog. `created -> payment_pending`. A repeat request gets `409`. |
 
 No route accepts a session ID, a "paid" flag, or a price from the buyer.
 
@@ -32,8 +32,9 @@ No route accepts a session ID, a "paid" flag, or a price from the buyer.
 ## Fail-closed group sizes
 `AggregateOnlyOutputPolicy` accepts results with no `groupSizes`. `executeJob`
 rejects them before the policy runs. It also rejects results where a group is
-below `minGroupSize` (10, from GLM's defaults) or where the group sizes add up
-to more than the dataset row count from the catalog. If the policy throws, the
+below `minGroupSize` (10, from GLM's defaults) where the group sizes add up
+to more than the dataset row count from the catalog, or where the catalog has no
+`rowCount` for the dataset. If the policy throws, the
 job fails closed.
 
 ## Webhook wiring (for the Stripe route owner; not modified here)

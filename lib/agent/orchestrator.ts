@@ -90,7 +90,8 @@ export async function startCheckout(
 ): Promise<CheckoutResponse> {
   const job = await deps.store.get(jobId);
   if (!job) throw new AgentError("invalid_request", "Unknown job");
-  if (job.status !== "created" && job.status !== "payment_pending") {
+  // One checkout per job: lib/payments maps a repeat request to 409.
+  if (job.status !== "created") {
     throw new AgentError("invalid_state", "Job is not awaiting checkout");
   }
   const dataset = await deps.datasets.get(job.datasetId);
@@ -102,15 +103,6 @@ export async function startCheckout(
     amountCents: dataset.priceCents,
     currency: "usd",
   });
-
-  // Retrying checkout: the provider is idempotent per job, so it must hand
-  // back the same session we already recorded.
-  if (job.status === "payment_pending") {
-    if (checkout.sessionId !== job.stripeSessionId) {
-      throw new AgentError("invalid_state", "Checkout session mismatch");
-    }
-    return checkout;
-  }
 
   const updated = await deps.store.transition(jobId, "created", "payment_pending", {
     stripeSessionId: checkout.sessionId,

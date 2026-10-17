@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { confirmPayment, createJob, executeJob, failPayment, startCheckout } from "../orchestrator";
 import { SnapshotAuthorizer } from "../executionAuth";
-import { execution, makeDeps } from "./fakes";
+import { StaticDatasetCatalog } from "../datasets";
+import { dataset, execution, makeDeps } from "./fakes";
 
 async function paidJob() {
   const ctx = makeDeps();
@@ -25,9 +26,6 @@ describe("job creation and payment", () => {
     const stored = await deps.store.get(job.id);
     expect(stored?.status).toBe("payment_pending");
     expect(stored?.stripeSessionId).toBe(checkout.sessionId);
-    // Retrying checkout returns the same session instead of creating another.
-    expect(await startCheckout(deps, job.id)).toEqual(checkout);
-    await deps.store.transition(job.id, "payment_pending", "payment_failed");
     await expect(startCheckout(deps, job.id)).rejects.toThrow("not awaiting checkout");
   });
 
@@ -164,6 +162,15 @@ describe("executeJob", () => {
     expect(job.result).toBeUndefined();
     expect(policyCalls).toBe(0);
     expect(deps.codegen.requests[1].previousFailures[0]).toContain("missing groupSizes");
+  });
+
+  it("rejects every result for a dataset without a trusted row count", async () => {
+    const { deps, jobId } = await paidJob();
+    deps.datasets = new StaticDatasetCatalog([{ ...dataset, rowCount: undefined }]);
+    const job = await executeJob(deps, jobId);
+    expect(job.status).toBe("rejected");
+    expect(job.result).toBeUndefined();
+    expect(deps.codegen.requests[1].previousFailures[0]).toContain("no trusted row count");
   });
 
   it("rejects group sizes that exceed the dataset row count", async () => {
