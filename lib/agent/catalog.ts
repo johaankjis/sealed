@@ -23,3 +23,15 @@ export const COFFEE_DATASET: DatasetDescriptor = {
 };
 
 export const DEMO_CATALOG: DatasetDescriptor[] = [COFFEE_DATASET];
+
+/**
+ * Reviewed SHA256 digests of synthetic fixtures. Single-sandbox mode refuses
+ * any file not listed here. Update only after reviewing a regenerated fixture
+ * (catalog.test.ts checks the digest against the file).
+ */
+export const SYNTHETIC_DATASET_REGISTRY: Record<string, { sha256: string; tableName: string }> = {
+  [COFFEE_DATASET.id]: {
+    sha256: "6858719376834cb295e5519e569a81770352a9dc7433b0642cd694be349e7f25",
+    tableName: COFFEE_DATASET.tableName,
+  },
+};

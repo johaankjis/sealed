@@ -3,14 +3,19 @@ import type { QueryJob } from "../../contracts/job";
 import type { PaymentProvider, PaymentVerification } from "../../contracts/payments";
 import type { SandboxRuntime } from "../../contracts/sandbox";
 import { createPaymentProvider } from "../payments";
-import { CreateOSRuntime, type CreateOSSandbox } from "../sandbox/createos";
+import { CreateOSRuntime } from "../sandbox/createos";
+import { singleSandboxFromEnv, type SingleSandboxConfig } from "../sandbox/single";
 import { AggregateOnlyOutputPolicy, DEFAULT_OUTPUT_POLICY_OPTIONS } from "../security";
-import { DEMO_CATALOG } from "./catalog";
+import { DEMO_CATALOG, SYNTHETIC_DATASET_REGISTRY } from "./catalog";
+import { PROBE_HOST, verifyEgressBlocked } from "./egress";
 import { ClaudeCodeGenerator, type CodeGenerator } from "./codegen";
 import { StaticDatasetCatalog, type DatasetCatalog } from "./datasets";
 import { SnapshotAuthorizer } from "./executionAuth";
 import { InMemoryJobStore, type JobStore } from "./jobStore";
+import { SequentialSandboxRuntime } from "./sequentialSandbox";
 import { confirmPayment, executeJob, failPayment, type AgentDeps } from "./orchestrator";
+
+export { verifyEgressBlocked } from "./egress";
 
 // Server-only composition root. Every API route and the Stripe webhook go
 // through getAgentRuntime() so the app has exactly one JobStore.
@@ -24,8 +29,8 @@ export class ConfigError extends Error {
   }
 }
 
-function requireEnv(name: string): string {
-  const value = process.env[name]?.trim();
+function requireEnv(name: string, env: Record<string, string | undefined> = process.env): string {
+  const value = env[name]?.trim();
   if (!value) throw new ConfigError(name);
   return value;
 }
@@ -34,31 +39,6 @@ function requireEnv(name: string): string {
 function lazy<T>(build: () => T): () => T {
   let value: T | undefined;
   return () => (value ??= build());
-}
-
-const PROBE_HOST = process.env.SEALED_EGRESS_PROBE_HOST ?? "1.1.1.1";
-const PROBE_SCRIPT = [
-  "import socket",
-  "try:",
-  `    socket.create_connection((${JSON.stringify(PROBE_HOST)}, 443), timeout=5).close()`,
-  "    print('OPEN')",
-  "except OSError:",
-  "    print('BLOCKED')",
-].join("\n");
-
-/**
- * Empirical egress check run inside each sandbox before data or code is
- * uploaded: a connection to a host outside the allowlist must fail. This is
- * evidence for one destination, not a proof of zero egress.
- */
-export async function verifyEgressBlocked(sandbox: CreateOSSandbox): Promise<void> {
-  const { result } = await sandbox.runCommand("python3", ["-I", "-c", PROBE_SCRIPT], {
-    timeoutMs: 20_000,
-    retry: false,
-  });
-  if (result.exit_code !== 0 || result.stdout.trim() !== "BLOCKED") {
-    throw new Error("Sandbox egress probe was not blocked");
-  }
 }
 
 /** Table names come from the trusted catalog so the runner and the generated SQL agree. */
@@ -94,6 +74,55 @@ export function createSandboxRuntime(
   });
 }
 
+/**
+ * `snapshot-fork` (default): a fresh CreateOS VM per job with forks per attempt.
+ * `single-synthetic`: Codex's cooperative shared-VM mode. Synthetic demo data
+ * only, NOT isolation for hostile code or private customer data.
+ * Unknown values fail closed instead of falling back.
+ */
+export type SandboxMode = "snapshot-fork" | "single-synthetic";
+
+export function sandboxModeFromEnv(env: Record<string, string | undefined> = process.env): SandboxMode {
+  const mode = env.SEALED_SANDBOX_MODE?.trim();
+  if (!mode || mode === "snapshot-fork") return "snapshot-fork";
+  if (mode === "single-synthetic") return mode;
+  throw new ConfigError("SEALED_SANDBOX_MODE (expected snapshot-fork or single-synthetic)");
+}
+
+/**
+ * Single-sandbox wiring. Each job gets a fresh SingleSandboxRuntime, queued so
+ * only one lifecycle holds the shared VM at a time. The dataset allowlist is
+ * the reviewed synthetic registry; payment authorization is the same
+ * SnapshotAuthorizer the snapshot mode uses.
+ */
+export function createSingleSandboxRuntime(
+  authorizer: SnapshotAuthorizer,
+  env: Record<string, string | undefined> = process.env,
+  client: SingleSandboxConfig["client"] = createClient({
+    apiKey: requireEnv("CREATEOS_SANDBOX_API_KEY", env),
+    retry: false,
+  })
+): SandboxRuntime {
+  const config: SingleSandboxConfig = {
+    client,
+    syntheticDatasets: SYNTHETIC_DATASET_REGISTRY,
+    authorizeExecution: authorizer.authorize,
+    timeoutMs: 30_000,
+  };
+  // Validates the opt-in and the exact shared sandbox ID up front.
+  singleSandboxFromEnv(config, env as NodeJS.ProcessEnv);
+  console.warn(
+    "[sealed] single-synthetic sandbox mode: cooperative shared VM, synthetic data only; " +
+      "not isolation for hostile code or customer data"
+  );
+  return new SequentialSandboxRuntime(() => singleSandboxFromEnv(config, env as NodeJS.ProcessEnv));
+}
+
+/** Per-mode generation retries: each single-sandbox lifecycle allows one execute. */
+export function agentRetriesFor(mode: SandboxMode): number {
+  return mode === "single-synthetic" ? 0 : 2;
+}
+
 export interface AgentRuntime {
   deps: AgentDeps;
   store: JobStore;
@@ -103,9 +132,14 @@ function buildRuntime(): AgentRuntime {
   const store = new InMemoryJobStore();
   const authorizer = new SnapshotAuthorizer(store);
   const datasets = new StaticDatasetCatalog(DEMO_CATALOG);
+  const mode = sandboxModeFromEnv();
 
   const payments = lazy(() => createPaymentProvider());
-  const sandbox = lazy(() => createSandboxRuntime(authorizer, datasets));
+  const sandbox = lazy(() =>
+    mode === "single-synthetic"
+      ? createSingleSandboxRuntime(authorizer)
+      : createSandboxRuntime(authorizer, datasets)
+  );
   const codegen = lazy(() => new ClaudeCodeGenerator());
 
   const lazyPayments: PaymentProvider = {
@@ -128,6 +162,7 @@ function buildRuntime(): AgentRuntime {
     codegen: lazyCodegen,
     snapshots: authorizer,
     minGroupSize: DEFAULT_OUTPUT_POLICY_OPTIONS.minGroupSize,
+    options: { maxRetries: agentRetriesFor(mode) },
     onEvent: (event) => console.info("[sealed]", JSON.stringify(event)),
   };
   return { deps, store };

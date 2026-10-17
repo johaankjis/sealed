@@ -14,6 +14,8 @@ into the Next.js API routes.
 - `codegen.ts`: `ClaudeCodeGenerator` (forced `submit_analysis` tool). Its runtime contract matches `sandbox/runner.py`: `con`, table `dataset`, assign `result`.
 - `catalog.ts` and `demo/coffee.ts` / `fixtures/downtown-coffee-sales.csv`: the synthetic coffee-chain dataset (20,010 rows, seed 42). Regenerate it with `node lib/agent/demo/coffee.ts`.
 - `http.ts`: maps errors to buyer-safe HTTP responses.
+- `egress.ts`: the in-sandbox egress probe (`verifyEgressBlocked`), shared by `server.ts` and the live test.
+- `live/`: a manual, billable live smoke test (`coffee-live.ts --run`). Nothing in the app may import it. See `live/README.md`.
 
 ## API routes (app/api, added in Sprint 2)
 | Route | Behaviour |
@@ -57,11 +59,13 @@ Until the route exists, buyer polling on `GET /api/jobs/:id` advances paid jobs.
 | `STRIPE_SECRET_KEY` | yes | Checkout and payment verification |
 | `STRIPE_WEBHOOK_SECRET` | for the webhook route | lib/payments |
 | `NEXT_PUBLIC_APP_URL` / `APP_URL` | no (default `http://localhost:3000`) | Checkout return URLs |
-| `CREATEOS_SANDBOX_API_KEY` | yes | CreateOS SDK client (`createClient({ apiKey, retry: false })`) |
-| `SEALED_CREATEOS_SHAPE` | yes | e.g. `s-1vcpu-1gb` |
-| `SEALED_CREATEOS_ROOTFS` | yes | Trusted image with python3, DuckDB and GNU `timeout` |
-| `SEALED_CREATEOS_EGRESS` | yes | Comma-separated, **non-empty** allowlist (empty means unrestricted) |
-| `SEALED_EGRESS_PROBE_HOST` | no (default `1.1.1.1`) | Must be outside the allowlist; see below |
+| `SEALED_SANDBOX_MODE` | no (default `snapshot-fork`) | `snapshot-fork` or `single-synthetic`; any other value returns `503` (fail closed) |
+| `CREATEOS_SANDBOX_API_KEY` | yes (both modes) | CreateOS SDK client (`createClient({ apiKey, retry: false })`); key for the credited account |
+| `SEALED_CREATEOS_SHAPE` | snapshot-fork | e.g. `s-1vcpu-1gb` |
+| `SEALED_CREATEOS_ROOTFS` | snapshot-fork | Trusted image with python3, DuckDB and GNU `timeout` |
+| `SEALED_CREATEOS_EGRESS` | snapshot-fork | Comma-separated, **non-empty** allowlist (empty means unrestricted) |
+| `SEALED_EGRESS_PROBE_HOST` | no (default `1.1.1.1`) | snapshot-fork; must be outside the allowlist; see below |
+| `SEALED_SHARED_SANDBOX_ID` | single-synthetic | Must equal `sb-01m563ts9ekxrv0q85yptqsrh7` (`sealed-runtime`), or the mode refuses to start |
 | `SEALED_DATA_DIR` | no (default `lib/agent/fixtures`) | Location of dataset CSVs |
 
 If a required variable is missing, the route that needs it returns `503`. Job
@@ -71,6 +75,58 @@ creation and polling still work.
 uploaded, that tries a TCP connection to the probe host on port 443. Any result
 other than `BLOCKED` aborts the run. This is evidence for one destination only,
 not a zero-egress guarantee.
+
+## Sandbox modes
+**`snapshot-fork` (default).** Each job gets a fresh VM, and each attempt gets
+its own fork. This is the mode intended for isolation. It still needs live
+validation with a prepared template (see Integration blockers).
+
+**`single-synthetic` (explicit opt-in, demo only).** This uses Codex's
+`SingleSandboxRuntime` (`lib/sandbox/single.ts`, `sandbox/SINGLE_SANDBOX.md`) on
+the existing `sealed-runtime` VM, attached with `getSandbox` only. It never
+creates, forks, pauses or destroys a VM.
+
+> **This is a cooperative shared VM, not isolation.** Jobs share a guest user
+> and can deliberately escape the supervisor or leave changes behind. Use it
+> only with the reviewed synthetic fixtures. Never use it for customer data or
+> untrusted tenants.
+
+How single-synthetic mode is wired in `server.ts`:
+- **Opt-in checked at startup:** `sandboxModeFromEnv` selects the mode.
+  `createSingleSandboxRuntime` calls Codex's `singleSandboxFromEnv`, which
+  rejects a missing opt-in or the wrong shared sandbox ID. It logs a warning.
+- **Synthetic data only:** the dataset allowlist is
+  `SYNTHETIC_DATASET_REGISTRY` in `catalog.ts`, which holds the reviewed SHA256
+  digest and table name. Any other file bytes are refused before the VM is
+  contacted. `catalog.test.ts` checks the digest against the file.
+- **Payment gating unchanged:** `SnapshotAuthorizer` binds the per-job handle,
+  and the adapter calls it before uploading generated code. Jobs still only run
+  after payment is verified (Stripe webhook or buyer poll), exactly as in the
+  default mode.
+- **Queued, one at a time:** `SequentialSandboxRuntime` serializes whole
+  prepare → execute → destroy lifecycles, with a fresh adapter instance per job
+  and a 10-minute queue wait limit. It sits inside `AgentDeps.sandbox`, so both
+  the poll path and the webhook route's direct `executeJob` call are
+  serialized. Without it, concurrent jobs would fail with `SHARED_SANDBOX_BUSY`.
+- **No generation retries:** `maxRetries` is 0, because each lifecycle allows
+  exactly one `execute`.
+- **Timeouts and cleanup:** the remote supervisor enforces a 30s limit (exit
+  124 maps to `execution_failed`). The adapter removes the job's temporary
+  directory before returning a result. If the transport is ambiguous, the
+  adapter quarantines the lease. Later jobs then fail closed with
+  `sandbox_unavailable` instead of waiting, until an operator reconciles it as
+  described in `sandbox/SINGLE_SANDBOX.md`. Never recover by destroying the VM.
+- **Same validation as the default mode:** the group-size check and
+  `AggregateOnlyOutputPolicy` still decide what is published.
+
+Example (server environment only; never commit):
+```dotenv
+SEALED_SANDBOX_MODE=single-synthetic
+SEALED_SHARED_SANDBOX_ID=sb-01m563ts9ekxrv0q85yptqsrh7
+CREATEOS_SANDBOX_API_KEY=<credited-account sandbox key>
+ANTHROPIC_API_KEY=<key>
+STRIPE_SECRET_KEY=<sk_test_... key>
+```
 
 ## Running
 Use a long-lived process: `npm run build && npm start`. Serverless will not
@@ -83,6 +139,18 @@ memory.
 Simulated: the Anthropic HTTP response, Stripe, and the CreateOS VM. The fake VM
 checks that the runner, dataset and generated code were uploaded, then computes
 the expected SQL result in TypeScript. Generated Python is never run on the host.
+`integration-single.test.ts` covers single-synthetic mode the same way, with a
+fake shared VM that follows Codex's lease, probe, supervisor and cleanup
+protocol. It covers:
+- a completed coffee job;
+- no VM contact before payment;
+- concurrent jobs run one at a time;
+- a remote timeout;
+- a policy rejection;
+- a synthetic-digest mismatch;
+- quarantine.
+
+Shared simulation helpers live in `coffeeSim.ts`.
 
 ## Integration blockers
 1. **No live end-to-end run yet.** That needs Stripe test keys, an Anthropic key, and a CreateOS image with DuckDB preinstalled. Codex installed DuckDB on the `sealed-test` VM, not in a reusable rootfs.
