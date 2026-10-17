@@ -40,10 +40,16 @@ export interface StripePaymentProviderOptions {
   stripeClient?: Stripe;
 }
 
+interface CachedCheckoutEntry {
+  fingerprint: string;
+  response: CheckoutResponse;
+}
+
 export class StripePaymentProvider implements PaymentProvider {
   private readonly stripe: Stripe;
   private readonly appBaseUrl: string;
   private readonly platformFeeBps: number;
+  private readonly checkoutCache = new Map<string, CachedCheckoutEntry>();
 
   constructor(options: StripePaymentProviderOptions = {}) {
     if (options.stripeClient) {
@@ -95,6 +101,19 @@ export class StripePaymentProvider implements PaymentProvider {
       );
     }
 
+    const normalizedOwner = request.ownerAccountId?.trim() ?? "";
+    const fingerprint = `${request.amountCents}:${request.currency}:${normalizedOwner}`;
+    const existing = this.checkoutCache.get(jobId);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new PaymentError(
+          "INVALID_CHECKOUT_REQUEST",
+          `Checkout parameters for job ${jobId} do not match the existing checkout session.`
+        );
+      }
+      return { ...existing.response };
+    }
+
     const encodedJobId = encodeURIComponent(jobId);
     const metadata: Record<string, string> = { jobId };
 
@@ -109,7 +128,7 @@ export class StripePaymentProvider implements PaymentProvider {
         request.ownerAccountId,
         this.platformFeeBps
       );
-      metadata.ownerAccountId = request.ownerAccountId.trim();
+      metadata.ownerAccountId = normalizedOwner;
     } else {
       paymentIntentData = {
         metadata: { jobId },
@@ -162,10 +181,12 @@ export class StripePaymentProvider implements PaymentProvider {
       );
     }
 
-    return {
+    const response: CheckoutResponse = {
       sessionId: session.id,
       checkoutUrl: session.url,
     };
+    this.checkoutCache.set(jobId, { fingerprint, response });
+    return { ...response };
   }
 
   async verifyPayment(sessionId: string): Promise<PaymentVerification> {

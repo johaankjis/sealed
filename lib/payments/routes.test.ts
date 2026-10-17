@@ -4,8 +4,8 @@ import { POST as checkoutPost } from "../../app/api/checkout/route";
 import { POST as stripeWebhookPost } from "../../app/api/webhooks/stripe/route";
 import {
   type AgentEvent,
+  COFFEE_DATASET,
   createJob,
-  type DatasetDescriptor,
   InMemoryJobStore,
   StaticDatasetCatalog,
 } from "../agent";
@@ -16,19 +16,6 @@ import {
 
 const TEST_WEBHOOK_SECRET = "whsec_test_route_secret_987654321";
 const signerStripe = new Stripe("sk_test_offline_route_signer");
-
-const COFFEE_DATASET: DatasetDescriptor = {
-  id: "downtown-coffee-sales",
-  name: "Downtown Coffee Sales",
-  description: "Anonymized POS coffee transactions",
-  path: "/data/downtown-coffee-sales.csv",
-  tableName: "dataset",
-  columns: [
-    { name: "drink_category", type: "VARCHAR" },
-    { name: "revenue", type: "DOUBLE" },
-  ],
-  priceCents: 900,
-};
 
 function signWebhookEvent(
   eventPayload: Record<string, unknown>,
@@ -200,7 +187,37 @@ describe("POST /api/checkout", () => {
     expect(missingJobId.status).toBe(400);
   });
 
-  it("returns 409 when job is not in created status", async () => {
+  it("idempotently returns the existing session on retry while payment_pending without creating duplicate Stripe sessions", async () => {
+    let callCount = 0;
+    const createSession = vi.fn().mockImplementation(async (params: Stripe.Checkout.SessionCreateParams) => {
+      callCount += 1;
+      return {
+        id: `cs_test_${params.client_reference_id}_${callCount}`,
+        url: `https://checkout.stripe.com/c/pay/cs_test_${params.client_reference_id}_${callCount}`,
+      };
+    });
+    const { store, datasets } = setupTestContext({ createSession });
+    const job = await createJob(
+      { store, datasets },
+      { datasetId: COFFEE_DATASET.id, question: "Top categories?" }
+    );
+
+    const first = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+
+    const second = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+
+    expect(secondBody).toEqual(firstBody);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    const stored = await store.get(job.id);
+    expect(stored?.status).toBe("payment_pending");
+    expect(stored?.stripeSessionId).toBe(firstBody.sessionId);
+  });
+
+  it("returns 409 when job is no longer awaiting checkout or if provider returns a mismatched session on retry", async () => {
     const { store, datasets } = setupTestContext();
     const job = await createJob(
       { store, datasets },
@@ -210,8 +227,26 @@ describe("POST /api/checkout", () => {
     const first = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
     expect(first.status).toBe(200);
 
-    const second = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
-    expect(second.status).toBe(409);
+    // Once payment is confirmed (or failed), checkout must be rejected with 409
+    await store.transition(job.id, "payment_pending", "paid");
+    const afterPaid = await checkoutPost(makeCheckoutRequest({ jobId: job.id }));
+    expect(afterPaid.status).toBe(409);
+
+    // If a non-idempotent provider returns a different sessionId while payment_pending, reject with 409
+    const secondJob = await createJob(
+      { store, datasets },
+      { datasetId: COFFEE_DATASET.id, question: "Weekday rush?" }
+    );
+    await store.transition(secondJob.id, "created", "payment_pending", {
+      stripeSessionId: "cs_original_session",
+    });
+    const mismatchRes = await checkoutPost(
+      makeCheckoutRequest({ jobId: secondJob.id })
+    );
+    expect(mismatchRes.status).toBe(409);
+    expect((await store.get(secondJob.id))?.stripeSessionId).toBe(
+      "cs_original_session"
+    );
   });
 
   it("automatically coordinates with Claude's globalThis.__sealedAgent runtime when present", async () => {
