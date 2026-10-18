@@ -4,12 +4,13 @@ import type { PaymentProvider, PaymentVerification } from "../../contracts/payme
 import type { SandboxRuntime } from "../../contracts/sandbox";
 import { createPaymentProvider } from "../payments";
 import { CreateOSRuntime } from "../sandbox/createos";
-import { singleSandboxFromEnv, type SingleSandboxConfig } from "../sandbox/single";
+import { SHARED_SANDBOX_ID, singleSandboxFromEnv, type SingleSandboxConfig } from "../sandbox/single";
 import { AggregateOnlyOutputPolicy, DEFAULT_OUTPUT_POLICY_OPTIONS } from "../security";
 import { DEMO_CATALOG, SYNTHETIC_DATASET_REGISTRY } from "./catalog";
 import { PROBE_HOST, verifyEgressBlocked } from "./egress";
 import { ClaudeCodeGenerator, type CodeGenerator } from "./codegen";
 import { StaticDatasetCatalog, type DatasetCatalog } from "./datasets";
+import { diagnosticCode, withSharedSandboxDiagnostics } from "./diagnostics";
 import { SnapshotAuthorizer } from "./executionAuth";
 import { InMemoryJobStore, type JobStore } from "./jobStore";
 import { SequentialSandboxRuntime } from "./sequentialSandbox";
@@ -97,25 +98,55 @@ export function sandboxModeFromEnv(env: Record<string, string | undefined> = pro
  */
 export function createSingleSandboxRuntime(
   authorizer: SnapshotAuthorizer,
-  env: Record<string, string | undefined> = process.env,
+  rawEnv: Record<string, string | undefined> = process.env,
   client: SingleSandboxConfig["client"] = createClient({
-    apiKey: requireEnv("CREATEOS_SANDBOX_API_KEY", env),
+    apiKey: requireEnv("CREATEOS_SANDBOX_API_KEY", rawEnv),
     retry: false,
   })
 ): SandboxRuntime {
+  // Stray whitespace or a CR from a .env file would otherwise fail the exact
+  // ID match only once a paid job runs. The ID must still match exactly.
+  const env = {
+    ...rawEnv,
+    SEALED_SANDBOX_MODE: rawEnv.SEALED_SANDBOX_MODE?.trim(),
+    SEALED_SHARED_SANDBOX_ID: rawEnv.SEALED_SHARED_SANDBOX_ID?.trim(),
+  };
   const config: SingleSandboxConfig = {
-    client,
+    client: withSharedSandboxDiagnostics(client, (entry) =>
+      console.info("[sealed] createos", JSON.stringify(entry))
+    ),
     syntheticDatasets: SYNTHETIC_DATASET_REGISTRY,
     authorizeExecution: authorizer.authorize,
     timeoutMs: 30_000,
   };
   // Validates the opt-in and the exact shared sandbox ID up front.
-  singleSandboxFromEnv(config, env as NodeJS.ProcessEnv);
+  singleSandboxFromEnv(config, env as unknown as NodeJS.ProcessEnv);
   console.warn(
     "[sealed] single-synthetic sandbox mode: cooperative shared VM, synthetic data only; " +
       "not isolation for hostile code or customer data"
   );
-  return new SequentialSandboxRuntime(() => singleSandboxFromEnv(config, env as NodeJS.ProcessEnv));
+  return new SequentialSandboxRuntime(() => singleSandboxFromEnv(config, env as unknown as NodeJS.ProcessEnv));
+}
+
+/**
+ * Refuses to build the runtime (so POST /api/jobs returns 503 before any
+ * checkout) when a paid job could not possibly execute. Reports variable
+ * names only, never values.
+ */
+export function assertExecutionConfigured(env: Record<string, string | undefined> = process.env): SandboxMode {
+  const mode = sandboxModeFromEnv(env);
+  requireEnv("ANTHROPIC_API_KEY", env);
+  requireEnv("CREATEOS_SANDBOX_API_KEY", env);
+  if (mode === "single-synthetic") {
+    if (env.SEALED_SHARED_SANDBOX_ID?.trim() !== SHARED_SANDBOX_ID) {
+      throw new ConfigError("SEALED_SHARED_SANDBOX_ID (must equal the sealed-runtime sandbox ID)");
+    }
+  } else {
+    for (const name of ["SEALED_CREATEOS_SHAPE", "SEALED_CREATEOS_ROOTFS", "SEALED_CREATEOS_EGRESS"]) {
+      requireEnv(name, env);
+    }
+  }
+  return mode;
 }
 
 /** Per-mode generation retries: each single-sandbox lifecycle allows one execute. */
@@ -132,7 +163,7 @@ function buildRuntime(): AgentRuntime {
   const store = new InMemoryJobStore();
   const authorizer = new SnapshotAuthorizer(store);
   const datasets = new StaticDatasetCatalog(DEMO_CATALOG);
-  const mode = sandboxModeFromEnv();
+  const mode = assertExecutionConfigured();
 
   const payments = lazy(() => createPaymentProvider());
   const sandbox = lazy(() =>
@@ -194,8 +225,7 @@ export function startExecution(jobId: string, runtime = getAgentRuntime()): Prom
     .then(() => undefined)
     .catch((err: unknown) => {
       // Log only the error class/code; messages may carry provider details.
-      const code = (err as { code?: string })?.code ?? (err as Error)?.name ?? "unknown";
-      console.error("[sealed] job execution error", jobId, code);
+      console.error("[sealed] job execution error", jobId, diagnosticCode(err));
     })
     .finally(() => running.delete(jobId));
 }

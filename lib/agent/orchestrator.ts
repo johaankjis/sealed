@@ -4,6 +4,7 @@ import type { ApprovedResult, ExecutionResult, OutputPolicy } from "../../contra
 import type { SandboxExecutionOptions, SandboxRuntime } from "../../contracts/sandbox";
 import { canExecuteJob, validateQuestion } from "../security";
 import { checkGeneratedCode } from "./codeCheck";
+import { diagnosticCode } from "./diagnostics";
 import type { CodeGenerator, GeneratedAnalysis } from "./codegen";
 import type { DatasetCatalog } from "./datasets";
 import type { SnapshotBindings } from "./executionAuth";
@@ -33,7 +34,17 @@ export type AgentEvent =
   | { type: "policy_rejected"; jobId: string; attempt: number }
   | { type: "policy_approved"; jobId: string; attempt: number }
   | { type: "sandbox_destroyed"; jobId: string }
-  | { type: "job_finished"; jobId: string; status: QueryJob["status"] };
+  /** Operator diagnostics: where it failed and a redacted code (see diagnostics.ts). */
+  | { type: "stage_failed"; jobId: string; stage: FailureStage; code: string; attempt?: number }
+  | { type: "job_finished"; jobId: string; status: QueryJob["status"]; errorCode?: string };
+
+export type FailureStage =
+  | "dataset"
+  | "sandbox_prepare"
+  | "generation"
+  | "sandbox_execute"
+  | "policy"
+  | "sandbox_destroy";
 
 export interface AgentDeps {
   store: JobStore;
@@ -260,19 +271,23 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
     patch: { result?: ApprovedResult; errorCode?: AgentErrorCode }
   ) => {
     const done = (await store.transition(jobId, from, to, patch))!;
-    emit({ type: "job_finished", jobId, status: done.status });
+    emit({ type: "job_finished", jobId, status: done.status, ...(done.errorCode ? { errorCode: done.errorCode } : {}) });
     return done;
   };
 
   const dataset = await deps.datasets.get(claimed.datasetId);
-  if (!dataset) return finish("running", "execution_failed", { errorCode: "dataset_not_found" });
+  if (!dataset) {
+    emit({ type: "stage_failed", jobId, stage: "dataset", code: "DATASET_NOT_IN_CATALOG" });
+    return finish("running", "execution_failed", { errorCode: "dataset_not_found" });
+  }
 
   let snapshotId: string;
   try {
     snapshotId = await sandbox.prepareDataset(dataset.id, dataset.path);
     deps.snapshots?.bind(snapshotId, jobId);
     emit({ type: "sandbox_prepared", jobId });
-  } catch {
+  } catch (err) {
+    emit({ type: "stage_failed", jobId, stage: "sandbox_prepare", code: diagnosticCode(err) });
     return finish("running", "execution_failed", { errorCode: "sandbox_unavailable" });
   }
 
@@ -290,7 +305,8 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
           dataset,
           previousFailures: failures,
         });
-      } catch {
+      } catch (err) {
+        emit({ type: "stage_failed", jobId, stage: "generation", code: diagnosticCode(err), attempt });
         lastError = "generation_failed";
         failures.push("The previous response could not be parsed; call submit_analysis with valid input.");
         continue;
@@ -310,6 +326,7 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
         if (!isExecutionResult(execution)) throw new Error("Sandbox returned malformed result");
       } catch (err) {
         emit({ type: "execution_error", jobId, attempt });
+        emit({ type: "stage_failed", jobId, stage: "sandbox_execute", code: diagnosticCode(err), attempt });
         lastError = "execution_failed";
         failures.push(`Execution failed: ${feedback(err instanceof Error ? err.message : String(err))}`);
         continue;
@@ -326,7 +343,8 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
         decision = evidenceProblem
           ? { approved: false, reason: evidenceProblem }
           : await policy.validate(execution);
-      } catch {
+      } catch (err) {
+        emit({ type: "stage_failed", jobId, stage: "policy", code: diagnosticCode(err), attempt });
         // Fail closed: if the policy cannot decide, nothing is released.
         return finish("validating", "execution_failed", { errorCode: "execution_failed" });
       }
@@ -362,9 +380,11 @@ export async function executeJob(deps: AgentDeps, jobId: string): Promise<QueryJ
     try {
       await sandbox.destroy(snapshotId);
       emit({ type: "sandbox_destroyed", jobId });
-    } catch {
+    } catch (err) {
       // Destroy failures must not change the job outcome; the sandbox layer
-      // is responsible for reaping leaked sandboxes.
+      // is responsible for reaping leaked sandboxes. Surface them, though: in
+      // single-sandbox mode this usually means a quarantined lease.
+      emit({ type: "stage_failed", jobId, stage: "sandbox_destroy", code: diagnosticCode(err) });
     }
   }
 }

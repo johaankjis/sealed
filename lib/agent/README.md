@@ -68,8 +68,34 @@ Until the route exists, buyer polling on `GET /api/jobs/:id` advances paid jobs.
 | `SEALED_SHARED_SANDBOX_ID` | single-synthetic | Must equal `sb-01m563ts9ekxrv0q85yptqsrh7` (`sealed-runtime`), or the mode refuses to start |
 | `SEALED_DATA_DIR` | no (default `lib/agent/fixtures`) | Location of dataset CSVs |
 
-If a required variable is missing, the route that needs it returns `503`. Job
-creation and polling still work.
+`getAgentRuntime()` checks that execution is configured before it builds
+anything. It needs `ANTHROPIC_API_KEY`, `CREATEOS_SANDBOX_API_KEY`, and either
+the snapshot-fork variables or the exact `SEALED_SHARED_SANDBOX_ID`. If anything
+is missing, `POST /api/jobs` returns `503` and no job or checkout is created, so
+buyers can't pay for a query that can't run. The log names the variable but
+never its value. `STRIPE_SECRET_KEY` is still checked lazily, at checkout.
+
+## Diagnosing failed jobs
+Buyers only see an opaque `errorCode`. Operators get redacted server log lines.
+These contain only codes, error classes, HTTP statuses, exit codes and file
+basenames. They never include messages, stdout/stderr, generated code, data or
+keys.
+- `[sealed] {"type":"stage_failed","stage":...,"code":...}`. The `stage` is one
+  of `dataset`, `sandbox_prepare`, `generation`, `sandbox_execute`, `policy` or
+  `sandbox_destroy`. The `code` comes from `diagnostics.ts`. Examples:
+  - `CONFIG:CREATEOS_SANDBOX_API_KEY`;
+  - a lib/sandbox code such as `SHARED_ATTACHMENT_REJECTED`,
+    `SHARED_EGRESS_UNVERIFIED`, `SHARED_LEASE_UNAVAILABLE`,
+    `SYNTHETIC_DATA_REQUIRED`, `SHARED_SANDBOX_BUSY`, `SANDBOX_TIMEOUT` or
+    `SHARED_RECONCILIATION_REQUIRED`;
+  - an SDK class and status, such as `AuthenticationError:401`.
+- `[sealed] {"type":"job_finished",...,"errorCode":...}`.
+- In single-synthetic mode, `[sealed] createos {...}` reports which provider
+  call failed. That covers `attach` (with sandbox status and ingress),
+  `egress_readback`, `upload` (with file basename) and `command` (with
+  `kind` set to `egress_probe`, `lease`, `supervisor`, `cleanup` or `other`,
+  plus the exit code). The adapter collapses SDK errors into one fixed code, so
+  this is how to tell, for example, an auth failure from an upload timeout.
 
 `verifyIsolation` runs a probe inside each sandbox, before any data or code is
 uploaded, that tries a TCP connection to the probe host on port 443. Any result
