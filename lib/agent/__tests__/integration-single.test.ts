@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SHARED_SANDBOX_ID, type SingleSandboxConfig } from "../../sandbox/single";
 import { AggregateOnlyOutputPolicy } from "../../security";
 import { COFFEE_DATASET, SYNTHETIC_DATASET_REGISTRY } from "../catalog";
@@ -17,6 +17,7 @@ import {
 import {
   claudeReturning,
   getJob,
+  json,
   REVENUE_BY_CATEGORY,
   simulateAnalysis,
   submitAndPay,
@@ -24,6 +25,7 @@ import {
   waitForTerminal,
 } from "./coffeeSim";
 import { FakePayments } from "./fakes";
+import { POST as createJobRoute } from "../../../app/api/jobs/route";
 
 // Single-sandbox mode end to end: API routes -> Stripe-confirmed job (fake
 // provider) -> Claude generation (canned tool_use) -> orchestrator ->
@@ -145,7 +147,11 @@ function setup(code: string) {
   return { vm, store, payments, claude, events };
 }
 
-afterEach(() => setAgentRuntime(undefined));
+afterEach(() => {
+  setAgentRuntime(undefined);
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 
 describe("sandbox mode selection", () => {
   it("defaults to snapshot-fork and requires an explicit opt-in", () => {
@@ -244,6 +250,39 @@ describe("single-sandbox mode: question -> generated Python -> shared VM -> vali
     } finally {
       SYNTHETIC_DATASET_REGISTRY[COFFEE_DATASET.id] = original;
     }
+  });
+
+  it("reports why preparation failed: stage, adapter code and the failing provider call", async () => {
+    const { vm, payments, events } = setup(REVENUE_BY_CATEGORY);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    vm.box.data.status = "paused";
+    const job = await submitAndPay("Which drink categories earn the most revenue?", payments);
+    const done = await waitForTerminal(job.id);
+    vm.box.data.status = "running";
+
+    expect(done.status).toBe("execution_failed");
+    expect(done.errorCode).toBe("sandbox_unavailable");
+    expect(done).not.toHaveProperty("stage");
+    expect(events).toContainEqual({
+      type: "stage_failed", jobId: job.id, stage: "sandbox_prepare", code: "SHARED_ATTACHMENT_REJECTED",
+    });
+    const logged = info.mock.calls.filter((c) => c[0] === "[sealed] createos").map((c) => JSON.parse(c[1] as string));
+    expect(logged).toContainEqual({ op: "attach", outcome: "ok", status: "paused", ingress: false });
+    expect(JSON.stringify(info.mock.calls)).not.toContain(ENV.CREATEOS_SANDBOX_API_KEY);
+    expect(vm.files.size).toBe(0);
+  });
+
+  it("refuses new jobs with 503 before checkout when single mode is misconfigured", async () => {
+    setAgentRuntime(undefined);
+    vi.stubEnv("SEALED_SANDBOX_MODE", "single-synthetic");
+    vi.stubEnv("SEALED_SHARED_SANDBOX_ID", SHARED_SANDBOX_ID);
+    vi.stubEnv("CREATEOS_SANDBOX_API_KEY", "");
+    vi.stubEnv("ANTHROPIC_API_KEY", "test");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await createJobRoute(json({ datasetId: COFFEE_DATASET.id, question: "Which drink categories earn the most?" }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "Service is not configured" });
+    expect((globalThis as { __sealedAgent?: unknown }).__sealedAgent).toBeUndefined();
   });
 
   // Keep last: quarantine holds the process-wide lease for this module.
